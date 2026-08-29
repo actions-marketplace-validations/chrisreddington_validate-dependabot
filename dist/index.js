@@ -11,12 +11,12 @@ import require$$1 from 'tls';
 import events$1 from 'events';
 import 'assert';
 import require$$6 from 'util';
-import require$$0 from 'node:assert';
-import require$$0$2 from 'node:net';
+import require$$0$1 from 'node:assert';
+import require$$1$1 from 'node:net';
 import require$$2 from 'node:http';
-import require$$0$1 from 'node:stream';
+import require$$0$2 from 'node:stream';
 import require$$5 from 'node:querystring';
-import require$$6$1 from 'node:events';
+import require$$0 from 'node:events';
 import require$$0$3 from 'node:diagnostics_channel';
 import require$$3 from 'node:util';
 import require$$4 from 'node:tls';
@@ -25,14 +25,15 @@ import require$$3$1 from 'node:zlib';
 import require$$5$1 from 'node:perf_hooks';
 import require$$8 from 'node:util/types';
 import require$$2$2 from 'node:crypto';
-import require$$1$1 from 'node:sqlite';
+import require$$1$2 from 'node:sqlite';
 import require$$2$1 from 'node:worker_threads';
-import require$$1$2 from 'node:async_hooks';
-import require$$1$3 from 'node:console';
-import require$$0$5 from 'node:fs/promises';
-import require$$1$4 from 'node:path';
+import require$$0$5 from 'node:url';
+import require$$1$3 from 'node:async_hooks';
+import require$$1$4 from 'node:console';
+import require$$0$6 from 'node:fs/promises';
+import require$$1$5 from 'node:path';
 import require$$2$3 from 'node:timers';
-import require$$1$5 from 'node:dns';
+import require$$1$6 from 'node:dns';
 import 'string_decoder';
 import 'child_process';
 import 'timers';
@@ -519,7 +520,8 @@ function requireSymbols () {
 	  kPingInterval: Symbol('ping interval'),
 	  kNoProxyAgent: Symbol('no proxy agent'),
 	  kHttpProxyAgent: Symbol('http proxy agent'),
-	  kHttpsProxyAgent: Symbol('https proxy agent')
+	  kHttpsProxyAgent: Symbol('https proxy agent'),
+	  kSocks5ProxyAgent: Symbol('socks5 proxy agent')
 	};
 	return symbols;
 }
@@ -1385,6 +1387,33 @@ function requireErrors () {
 	  }
 	}
 
+	class Socks5ProxyError extends UndiciError {
+	  constructor (message, code) {
+	    super(message);
+	    this.name = 'Socks5ProxyError';
+	    this.message = message || 'SOCKS5 proxy error';
+	    this.code = code || 'UND_ERR_SOCKS5';
+	  }
+	}
+
+	const kMessageSizeExceededError = Symbol.for('undici.error.UND_ERR_WS_MESSAGE_SIZE_EXCEEDED');
+	class MessageSizeExceededError extends UndiciError {
+	  constructor (message) {
+	    super(message);
+	    this.name = 'MessageSizeExceededError';
+	    this.message = message || 'Max decompressed message size exceeded';
+	    this.code = 'UND_ERR_WS_MESSAGE_SIZE_EXCEEDED';
+	  }
+
+	  static [Symbol.hasInstance] (instance) {
+	    return instance && instance[kMessageSizeExceededError] === true
+	  }
+
+	  get [kMessageSizeExceededError] () {
+	    return true
+	  }
+	}
+
 	errors = {
 	  AbortError,
 	  HTTPParserError,
@@ -1408,7 +1437,9 @@ function requireErrors () {
 	  RequestRetryError,
 	  ResponseError,
 	  SecureProxyConnectionError,
-	  MaxOriginsReachedError
+	  MaxOriginsReachedError,
+	  Socks5ProxyError,
+	  MessageSizeExceededError
 	};
 	return errors;
 }
@@ -1739,13 +1770,13 @@ function requireUtil$5 () {
 	if (hasRequiredUtil$5) return util$5;
 	hasRequiredUtil$5 = 1;
 
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { kDestroyed, kBodyUsed, kListeners, kBody } = requireSymbols();
 	const { IncomingMessage } = require$$2;
-	const stream = require$$0$1;
-	const net = require$$0$2;
+	const stream = require$$0$2;
+	const net = require$$1$1;
 	const { stringify } = require$$5;
-	const { EventEmitter: EE } = require$$6$1;
+	const { EventEmitter: EE } = require$$0;
 	const timers = requireTimers();
 	const { InvalidArgumentError, ConnectTimeoutError } = requireErrors();
 	const { headerNameLowerCasedRecord } = requireConstants$4();
@@ -2067,6 +2098,20 @@ function requireUtil$5 () {
 	}
 
 	/**
+	 * Checks whether an object has a safe Symbol.iterator — i.e. one that is
+	 * either own or inherited from a non-Object.prototype chain.  This prevents
+	 * prototype-pollution attacks from injecting a fake iterator on
+	 * Object.prototype.
+	 * @param {object} obj
+	 * @returns {boolean}
+	 */
+	function hasSafeIterator (obj) {
+	  const prototype = Object.getPrototypeOf(obj);
+	  const ownIterator = Object.prototype.hasOwnProperty.call(obj, Symbol.iterator);
+	  return ownIterator || (prototype != null && prototype !== Object.prototype && typeof obj[Symbol.iterator] === 'function')
+	}
+
+	/**
 	 * @param {Blob|Buffer|import ('stream').Stream} body
 	 * @returns {number|null}
 	 */
@@ -2165,19 +2210,39 @@ function requireUtil$5 () {
 	    const key = headerNameToString(headers[i]);
 	    let val = obj[key];
 
-	    if (val) {
-	      if (typeof val === 'string') {
-	        val = [val];
-	        obj[key] = val;
-	      }
-	      val.push(headers[i + 1].toString('latin1'));
-	    } else {
-	      const headersValue = headers[i + 1];
-	      if (typeof headersValue === 'string') {
-	        obj[key] = headersValue;
+	    if (val !== undefined) {
+	      if (!Object.hasOwn(obj, key)) {
+	        const headersValue = typeof headers[i + 1] === 'string'
+	          ? headers[i + 1]
+	          : Array.isArray(headers[i + 1])
+	            ? headers[i + 1].map(x => x.toString('latin1'))
+	            : headers[i + 1].toString('latin1');
+
+	        if (key === '__proto__') {
+	          Object.defineProperty(obj, key, {
+	            value: headersValue,
+	            enumerable: true,
+	            configurable: true,
+	            writable: true
+	          });
+	        } else {
+	          obj[key] = headersValue;
+	        }
 	      } else {
-	        obj[key] = Array.isArray(headersValue) ? headersValue.map(x => x.toString('latin1')) : headersValue.toString('latin1');
+	        if (typeof val === 'string') {
+	          val = [val];
+	          obj[key] = val;
+	        }
+	        val.push(headers[i + 1].toString('latin1'));
 	      }
+	    } else {
+	      const headersValue = typeof headers[i + 1] === 'string'
+	        ? headers[i + 1]
+	        : Array.isArray(headers[i + 1])
+	          ? headers[i + 1].map(x => x.toString('latin1'))
+	          : headers[i + 1].toString('latin1');
+
+	      obj[key] = headersValue;
 	    }
 	  }
 
@@ -2657,6 +2722,7 @@ function requireUtil$5 () {
 	  getServerName,
 	  isStream,
 	  isIterable,
+	  hasSafeIterator,
 	  isAsyncIterable,
 	  isDestroyed,
 	  headerNameToString,
@@ -2921,10 +2987,12 @@ function requireDiagnostics () {
 
 	  diagnosticsChannel.subscribe('undici:websocket:open',
 	    evt => {
-	      const {
-	        address: { address, port }
-	      } = evt;
-	      debugLog('connection opened %s%s', address, port ? `:${port}` : '');
+	      if (evt.address != null) {
+	        const { address, port } = evt.address;
+	        debugLog('connection opened %s%s', address, port ? `:${port}` : '');
+	      } else {
+	        debugLog('connection opened');
+	      }
 	    });
 
 	  diagnosticsChannel.subscribe('undici:websocket:close',
@@ -2981,7 +3049,7 @@ function requireRequest$1 () {
 	  InvalidArgumentError,
 	  NotSupportedError
 	} = requireErrors();
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const {
 	  isValidHTTPToken,
 	  isValidHeaderValue,
@@ -2990,6 +3058,7 @@ function requireRequest$1 () {
 	  isBuffer,
 	  isFormDataLike,
 	  isIterable,
+	  hasSafeIterator,
 	  isBlobLike,
 	  serializePathWithQuery,
 	  assertRequestHandler,
@@ -3002,6 +3071,21 @@ function requireRequest$1 () {
 
 	// Verifies that a given path is valid does not contain control chars \x00 to \x20
 	const invalidPathRegex = /[^\u0021-\u00ff]/;
+
+	function isValidContentLengthHeaderValue (val) {
+	  if (typeof val !== 'string' || val.length === 0) {
+	    return false
+	  }
+
+	  for (let i = 0; i < val.length; i++) {
+	    const charCode = val.charCodeAt(i);
+	    if (charCode < 48 || charCode > 57) {
+	      return false
+	    }
+	  }
+
+	  return true
+	}
 
 	const kHandler = Symbol('handler');
 
@@ -3021,7 +3105,8 @@ function requireRequest$1 () {
 	    expectContinue,
 	    servername,
 	    throwOnError,
-	    maxRedirections
+	    maxRedirections,
+	    typeOfService
 	  }, handler) {
 	    if (typeof path !== 'string') {
 	      throw new InvalidArgumentError('path must be a string')
@@ -3043,6 +3128,10 @@ function requireRequest$1 () {
 
 	    if (upgrade && typeof upgrade !== 'string') {
 	      throw new InvalidArgumentError('upgrade must be a string')
+	    }
+
+	    if (upgrade && !isValidHeaderValue(upgrade)) {
+	      throw new InvalidArgumentError('invalid upgrade header')
 	    }
 
 	    if (headersTimeout != null && (!Number.isFinite(headersTimeout) || headersTimeout < 0)) {
@@ -3069,11 +3158,17 @@ function requireRequest$1 () {
 	      throw new InvalidArgumentError('maxRedirections is not supported, use the redirect interceptor')
 	    }
 
+	    if (typeOfService != null && (!Number.isInteger(typeOfService) || typeOfService < 0 || typeOfService > 255)) {
+	      throw new InvalidArgumentError('typeOfService must be an integer between 0 and 255')
+	    }
+
 	    this.headersTimeout = headersTimeout;
 
 	    this.bodyTimeout = bodyTimeout;
 
 	    this.method = method;
+
+	    this.typeOfService = typeOfService ?? 0;
 
 	    this.abort = null;
 
@@ -3151,7 +3246,7 @@ function requireRequest$1 () {
 	        processHeader(this, headers[i], headers[i + 1]);
 	      }
 	    } else if (headers && typeof headers === 'object') {
-	      if (headers[Symbol.iterator]) {
+	      if (hasSafeIterator(headers)) {
 	        for (const header of headers) {
 	          if (!Array.isArray(header) || header.length !== 2) {
 	            throw new InvalidArgumentError('headers must be in key-value pair format')
@@ -3340,7 +3435,13 @@ function requireRequest$1 () {
 	      } else if (typeof val[i] === 'object') {
 	        throw new InvalidArgumentError(`invalid ${key} header`)
 	      } else {
-	        arr.push(`${val[i]}`);
+	        // Coerce primitives (and reject unsafe coercions such as functions
+	        // with a crafted toString/Symbol.toPrimitive).
+	        const str = `${val[i]}`;
+	        if (!isValidHeaderValue(str)) {
+	          throw new InvalidArgumentError(`invalid ${key} header`)
+	        }
+	        arr.push(str);
 	      }
 	    }
 	    val = arr;
@@ -3351,33 +3452,52 @@ function requireRequest$1 () {
 	  } else if (val === null) {
 	    val = '';
 	  } else {
+	    // Coerce primitives (and reject unsafe coercions such as functions
+	    // with a crafted toString/Symbol.toPrimitive).
 	    val = `${val}`;
+	    if (!isValidHeaderValue(val)) {
+	      throw new InvalidArgumentError(`invalid ${key} header`)
+	    }
 	  }
 
-	  if (request.host === null && headerName === 'host') {
+	  if (headerName === 'host') {
+	    if (request.host !== null) {
+	      throw new InvalidArgumentError('duplicate host header')
+	    }
 	    if (typeof val !== 'string') {
 	      throw new InvalidArgumentError('invalid host header')
 	    }
 	    // Consumed by Client
 	    request.host = val;
-	  } else if (request.contentLength === null && headerName === 'content-length') {
-	    request.contentLength = parseInt(val, 10);
-	    if (!Number.isFinite(request.contentLength)) {
+	  } else if (headerName === 'content-length') {
+	    if (request.contentLength !== null) {
+	      throw new InvalidArgumentError('duplicate content-length header')
+	    }
+	    if (!isValidContentLengthHeaderValue(val)) {
 	      throw new InvalidArgumentError('invalid content-length header')
 	    }
+	    request.contentLength = parseInt(val, 10);
 	  } else if (request.contentType === null && headerName === 'content-type') {
 	    request.contentType = val;
 	    request.headers.push(key, val);
 	  } else if (headerName === 'transfer-encoding' || headerName === 'keep-alive' || headerName === 'upgrade') {
 	    throw new InvalidArgumentError(`invalid ${headerName} header`)
 	  } else if (headerName === 'connection') {
-	    const value = typeof val === 'string' ? val.toLowerCase() : null;
-	    if (value !== 'close' && value !== 'keep-alive') {
+	    // Per RFC 7230 Section 6.1, Connection header can contain
+	    // a comma-separated list of connection option tokens (header names)
+	    const value = typeof val === 'string' ? val : null;
+	    if (value === null) {
 	      throw new InvalidArgumentError('invalid connection header')
 	    }
 
-	    if (value === 'close') {
-	      request.reset = true;
+	    for (const token of value.toLowerCase().split(',')) {
+	      const trimmed = token.trim();
+	      if (!isValidHTTPToken(trimmed)) {
+	        throw new InvalidArgumentError('invalid connection header')
+	      }
+	      if (trimmed === 'close') {
+	        request.reset = true;
+	      }
 	    }
 	  } else if (headerName === 'expect') {
 	    throw new NotSupportedError('expect header not supported')
@@ -3417,6 +3537,10 @@ function requireWrapHandler () {
 	    return this.#handler.onConnect?.(abort, context)
 	  }
 
+	  onResponseStarted () {
+	    return this.#handler.onResponseStarted?.()
+	  }
+
 	  onHeaders (statusCode, rawHeaders, resume, statusMessage) {
 	    return this.#handler.onHeaders?.(statusCode, rawHeaders, resume, statusMessage)
 	  }
@@ -3450,7 +3574,7 @@ function requireWrapHandler () {
 	  onRequestUpgrade (controller, statusCode, headers, socket) {
 	    const rawHeaders = [];
 	    for (const [key, val] of Object.entries(headers)) {
-	      rawHeaders.push(Buffer.from(key), Array.isArray(val) ? val.map(v => Buffer.from(v)) : Buffer.from(val));
+	      rawHeaders.push(Buffer.from(key, 'latin1'), toRawHeaderValue(val));
 	    }
 
 	    this.#handler.onUpgrade?.(statusCode, rawHeaders, socket);
@@ -3459,7 +3583,7 @@ function requireWrapHandler () {
 	  onResponseStart (controller, statusCode, headers, statusMessage) {
 	    const rawHeaders = [];
 	    for (const [key, val] of Object.entries(headers)) {
-	      rawHeaders.push(Buffer.from(key), Array.isArray(val) ? val.map(v => Buffer.from(v)) : Buffer.from(val));
+	      rawHeaders.push(Buffer.from(key, 'latin1'), toRawHeaderValue(val));
 	    }
 
 	    if (this.#handler.onHeaders?.(statusCode, rawHeaders, () => controller.resume(), statusMessage) === false) {
@@ -3476,7 +3600,7 @@ function requireWrapHandler () {
 	  onResponseEnd (controller, trailers) {
 	    const rawTrailers = [];
 	    for (const [key, val] of Object.entries(trailers)) {
-	      rawTrailers.push(Buffer.from(key), Array.isArray(val) ? val.map(v => Buffer.from(v)) : Buffer.from(val));
+	      rawTrailers.push(Buffer.from(key, 'latin1'), toRawHeaderValue(val));
 	    }
 
 	    this.#handler.onComplete?.(rawTrailers);
@@ -3490,6 +3614,12 @@ function requireWrapHandler () {
 	    this.#handler.onError?.(err);
 	  }
 	};
+
+	function toRawHeaderValue (value) {
+	  return Array.isArray(value)
+	    ? value.map((item) => Buffer.from(item, 'latin1'))
+	    : Buffer.from(value, 'latin1')
+	}
 	return wrapHandler;
 }
 
@@ -3499,7 +3629,7 @@ var hasRequiredDispatcher;
 function requireDispatcher () {
 	if (hasRequiredDispatcher) return dispatcher;
 	hasRequiredDispatcher = 1;
-	const EventEmitter = require$$6$1;
+	const EventEmitter = require$$0;
 	const WrapHandler = requireWrapHandler();
 
 	const wrapInterceptor = (dispatch) => (opts, handler) => dispatch(opts, WrapHandler.wrap(handler));
@@ -3569,6 +3699,9 @@ function requireUnwrapHandler () {
 
 	  [kResume] = null
 
+	  rawHeaders = null
+	  rawTrailers = null
+
 	  constructor (abort) {
 	    this.#abort = abort;
 	  }
@@ -3623,12 +3756,18 @@ function requireUnwrapHandler () {
 	    this.#handler.onRequestStart?.(this.#controller, context);
 	  }
 
+	  onResponseStarted () {
+	    return this.#handler.onResponseStarted?.()
+	  }
+
 	  onUpgrade (statusCode, rawHeaders, socket) {
+	    this.#controller.rawHeaders = rawHeaders;
 	    this.#handler.onRequestUpgrade?.(this.#controller, statusCode, parseHeaders(rawHeaders), socket);
 	  }
 
 	  onHeaders (statusCode, rawHeaders, resume, statusMessage) {
 	    this.#controller[kResume] = resume;
+	    this.#controller.rawHeaders = rawHeaders;
 	    this.#handler.onResponseStart?.(this.#controller, statusCode, parseHeaders(rawHeaders), statusMessage);
 	    return !this.#controller.paused
 	  }
@@ -3639,6 +3778,7 @@ function requireUnwrapHandler () {
 	  }
 
 	  onComplete (rawTrailers) {
+	    this.#controller.rawTrailers = rawTrailers;
 	    this.#handler.onResponseEnd?.(this.#controller, parseHeaders(rawTrailers));
 	  }
 
@@ -3671,6 +3811,7 @@ function requireDispatcherBase () {
 
 	const kOnDestroyed = Symbol('onDestroyed');
 	const kOnClosed = Symbol('onClosed');
+	const kWebSocketOptions = Symbol('webSocketOptions');
 
 	class DispatcherBase extends Dispatcher {
 	  /** @type {boolean} */
@@ -3684,6 +3825,24 @@ function requireDispatcherBase () {
 
 	  /** @type {Array<Function>|null} */
 	  [kOnClosed] = null
+
+	  /**
+	   * @param {import('../../types/dispatcher').DispatcherOptions} [opts]
+	   */
+	  constructor (opts) {
+	    super();
+	    this[kWebSocketOptions] = opts?.webSocket ?? {};
+	  }
+
+	  /**
+	   * @returns {import('../../types/dispatcher').WebSocketOptions}
+	   */
+	  get webSocketOptions () {
+	    return {
+	      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
+	      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024 // 128 MB default
+	    }
+	  }
 
 	  /** @returns {boolean} */
 	  get destroyed () {
@@ -3833,8 +3992,8 @@ function requireConnect () {
 	if (hasRequiredConnect) return connect;
 	hasRequiredConnect = 1;
 
-	const net = require$$0$2;
-	const assert = require$$0;
+	const net = require$$1$1;
+	const assert = require$$0$1;
 	const util = requireUtil$5();
 	const { InvalidArgumentError } = requireErrors();
 
@@ -3869,6 +4028,22 @@ function requireConnect () {
 	  set (sessionKey, session) {
 	    if (this._maxCachedSessions === 0) {
 	      return
+	    }
+
+	    if (this._sessionCache.has(sessionKey)) {
+	      this._sessionCache.delete(sessionKey);
+	    } else if (this._sessionCache.size >= this._maxCachedSessions) {
+	      for (const [key, ref] of this._sessionCache) {
+	        if (ref.deref() === undefined) {
+	          this._sessionCache.delete(key);
+	          return
+	        }
+	      }
+
+	      const oldest = this._sessionCache.keys().next();
+	      if (!oldest.done) {
+	        this._sessionCache.delete(oldest.value);
+	      }
 	    }
 
 	    this._sessionCache.set(sessionKey, new WeakRef(session));
@@ -3999,12 +4174,12 @@ var hasRequiredConstants$3;
 function requireConstants$3 () {
 	if (hasRequiredConstants$3) return constants$3;
 	hasRequiredConstants$3 = 1;
-	(function (exports$1) {
-		Object.defineProperty(exports$1, "__esModule", { value: true });
-		exports$1.SPECIAL_HEADERS = exports$1.MINOR = exports$1.MAJOR = exports$1.HTAB_SP_VCHAR_OBS_TEXT = exports$1.QUOTED_STRING = exports$1.CONNECTION_TOKEN_CHARS = exports$1.HEADER_CHARS = exports$1.TOKEN = exports$1.HEX = exports$1.URL_CHAR = exports$1.USERINFO_CHARS = exports$1.MARK = exports$1.ALPHANUM = exports$1.NUM = exports$1.HEX_MAP = exports$1.NUM_MAP = exports$1.ALPHA = exports$1.STATUSES_HTTP = exports$1.H_METHOD_MAP = exports$1.METHOD_MAP = exports$1.METHODS_RTSP = exports$1.METHODS_ICE = exports$1.METHODS_HTTP = exports$1.HEADER_STATE = exports$1.FINISH = exports$1.STATUSES = exports$1.METHODS = exports$1.LENIENT_FLAGS = exports$1.FLAGS = exports$1.TYPE = exports$1.ERROR = void 0;
+	(function (exports) {
+		Object.defineProperty(exports, "__esModule", { value: true });
+		exports.SPECIAL_HEADERS = exports.MINOR = exports.MAJOR = exports.HTAB_SP_VCHAR_OBS_TEXT = exports.QUOTED_STRING = exports.CONNECTION_TOKEN_CHARS = exports.HEADER_CHARS = exports.TOKEN = exports.HEX = exports.URL_CHAR = exports.USERINFO_CHARS = exports.MARK = exports.ALPHANUM = exports.NUM = exports.HEX_MAP = exports.NUM_MAP = exports.ALPHA = exports.STATUSES_HTTP = exports.H_METHOD_MAP = exports.METHOD_MAP = exports.METHODS_RTSP = exports.METHODS_ICE = exports.METHODS_HTTP = exports.HEADER_STATE = exports.FINISH = exports.STATUSES = exports.METHODS = exports.LENIENT_FLAGS = exports.FLAGS = exports.TYPE = exports.ERROR = void 0;
 		const utils_1 = requireUtils();
 		// Emums
-		exports$1.ERROR = {
+		exports.ERROR = {
 		    OK: 0,
 		    INTERNAL: 1,
 		    STRICT: 2,
@@ -4043,12 +4218,12 @@ function requireConstants$3 () {
 		    CB_RESET: 31,
 		    CB_PROTOCOL_COMPLETE: 38,
 		};
-		exports$1.TYPE = {
+		exports.TYPE = {
 		    BOTH: 0, // default
 		    REQUEST: 1,
 		    RESPONSE: 2,
 		};
-		exports$1.FLAGS = {
+		exports.FLAGS = {
 		    CONNECTION_KEEP_ALIVE: 1 << 0,
 		    CONNECTION_CLOSE: 1 << 1,
 		    CONNECTION_UPGRADE: 1 << 2,
@@ -4060,7 +4235,7 @@ function requireConstants$3 () {
 		    // 1 << 8 is unused
 		    TRANSFER_ENCODING: 1 << 9,
 		};
-		exports$1.LENIENT_FLAGS = {
+		exports.LENIENT_FLAGS = {
 		    HEADERS: 1 << 0,
 		    CHUNKED_LENGTH: 1 << 1,
 		    KEEP_ALIVE: 1 << 2,
@@ -4072,7 +4247,7 @@ function requireConstants$3 () {
 		    OPTIONAL_CR_BEFORE_LF: 1 << 8,
 		    SPACES_AFTER_CHUNK_SIZE: 1 << 9,
 		};
-		exports$1.METHODS = {
+		exports.METHODS = {
 		    'DELETE': 0,
 		    'GET': 1,
 		    'HEAD': 2,
@@ -4133,7 +4308,7 @@ function requireConstants$3 () {
 		    /* DRAFT https://www.ietf.org/archive/id/draft-ietf-httpbis-safe-method-w-body-02.html */
 		    'QUERY': 46,
 		};
-		exports$1.STATUSES = {
+		exports.STATUSES = {
 		    CONTINUE: 100,
 		    SWITCHING_PROTOCOLS: 101,
 		    PROCESSING: 102,
@@ -4234,12 +4409,12 @@ function requireConstants$3 () {
 		    NETWORK_READ_TIMEOUT: 598, // Unofficial
 		    NETWORK_CONNECT_TIMEOUT: 599, // Unofficial
 		};
-		exports$1.FINISH = {
+		exports.FINISH = {
 		    SAFE: 0,
 		    SAFE_WITH_CB: 1,
 		    UNSAFE: 2,
 		};
-		exports$1.HEADER_STATE = {
+		exports.HEADER_STATE = {
 		    GENERAL: 0,
 		    CONNECTION: 1,
 		    CONTENT_LENGTH: 2,
@@ -4251,203 +4426,203 @@ function requireConstants$3 () {
 		    TRANSFER_ENCODING_CHUNKED: 8,
 		};
 		// C headers
-		exports$1.METHODS_HTTP = [
-		    exports$1.METHODS.DELETE,
-		    exports$1.METHODS.GET,
-		    exports$1.METHODS.HEAD,
-		    exports$1.METHODS.POST,
-		    exports$1.METHODS.PUT,
-		    exports$1.METHODS.CONNECT,
-		    exports$1.METHODS.OPTIONS,
-		    exports$1.METHODS.TRACE,
-		    exports$1.METHODS.COPY,
-		    exports$1.METHODS.LOCK,
-		    exports$1.METHODS.MKCOL,
-		    exports$1.METHODS.MOVE,
-		    exports$1.METHODS.PROPFIND,
-		    exports$1.METHODS.PROPPATCH,
-		    exports$1.METHODS.SEARCH,
-		    exports$1.METHODS.UNLOCK,
-		    exports$1.METHODS.BIND,
-		    exports$1.METHODS.REBIND,
-		    exports$1.METHODS.UNBIND,
-		    exports$1.METHODS.ACL,
-		    exports$1.METHODS.REPORT,
-		    exports$1.METHODS.MKACTIVITY,
-		    exports$1.METHODS.CHECKOUT,
-		    exports$1.METHODS.MERGE,
-		    exports$1.METHODS['M-SEARCH'],
-		    exports$1.METHODS.NOTIFY,
-		    exports$1.METHODS.SUBSCRIBE,
-		    exports$1.METHODS.UNSUBSCRIBE,
-		    exports$1.METHODS.PATCH,
-		    exports$1.METHODS.PURGE,
-		    exports$1.METHODS.MKCALENDAR,
-		    exports$1.METHODS.LINK,
-		    exports$1.METHODS.UNLINK,
-		    exports$1.METHODS.PRI,
+		exports.METHODS_HTTP = [
+		    exports.METHODS.DELETE,
+		    exports.METHODS.GET,
+		    exports.METHODS.HEAD,
+		    exports.METHODS.POST,
+		    exports.METHODS.PUT,
+		    exports.METHODS.CONNECT,
+		    exports.METHODS.OPTIONS,
+		    exports.METHODS.TRACE,
+		    exports.METHODS.COPY,
+		    exports.METHODS.LOCK,
+		    exports.METHODS.MKCOL,
+		    exports.METHODS.MOVE,
+		    exports.METHODS.PROPFIND,
+		    exports.METHODS.PROPPATCH,
+		    exports.METHODS.SEARCH,
+		    exports.METHODS.UNLOCK,
+		    exports.METHODS.BIND,
+		    exports.METHODS.REBIND,
+		    exports.METHODS.UNBIND,
+		    exports.METHODS.ACL,
+		    exports.METHODS.REPORT,
+		    exports.METHODS.MKACTIVITY,
+		    exports.METHODS.CHECKOUT,
+		    exports.METHODS.MERGE,
+		    exports.METHODS['M-SEARCH'],
+		    exports.METHODS.NOTIFY,
+		    exports.METHODS.SUBSCRIBE,
+		    exports.METHODS.UNSUBSCRIBE,
+		    exports.METHODS.PATCH,
+		    exports.METHODS.PURGE,
+		    exports.METHODS.MKCALENDAR,
+		    exports.METHODS.LINK,
+		    exports.METHODS.UNLINK,
+		    exports.METHODS.PRI,
 		    // TODO(indutny): should we allow it with HTTP?
-		    exports$1.METHODS.SOURCE,
-		    exports$1.METHODS.QUERY,
+		    exports.METHODS.SOURCE,
+		    exports.METHODS.QUERY,
 		];
-		exports$1.METHODS_ICE = [
-		    exports$1.METHODS.SOURCE,
+		exports.METHODS_ICE = [
+		    exports.METHODS.SOURCE,
 		];
-		exports$1.METHODS_RTSP = [
-		    exports$1.METHODS.OPTIONS,
-		    exports$1.METHODS.DESCRIBE,
-		    exports$1.METHODS.ANNOUNCE,
-		    exports$1.METHODS.SETUP,
-		    exports$1.METHODS.PLAY,
-		    exports$1.METHODS.PAUSE,
-		    exports$1.METHODS.TEARDOWN,
-		    exports$1.METHODS.GET_PARAMETER,
-		    exports$1.METHODS.SET_PARAMETER,
-		    exports$1.METHODS.REDIRECT,
-		    exports$1.METHODS.RECORD,
-		    exports$1.METHODS.FLUSH,
+		exports.METHODS_RTSP = [
+		    exports.METHODS.OPTIONS,
+		    exports.METHODS.DESCRIBE,
+		    exports.METHODS.ANNOUNCE,
+		    exports.METHODS.SETUP,
+		    exports.METHODS.PLAY,
+		    exports.METHODS.PAUSE,
+		    exports.METHODS.TEARDOWN,
+		    exports.METHODS.GET_PARAMETER,
+		    exports.METHODS.SET_PARAMETER,
+		    exports.METHODS.REDIRECT,
+		    exports.METHODS.RECORD,
+		    exports.METHODS.FLUSH,
 		    // For AirPlay
-		    exports$1.METHODS.GET,
-		    exports$1.METHODS.POST,
+		    exports.METHODS.GET,
+		    exports.METHODS.POST,
 		];
-		exports$1.METHOD_MAP = (0, utils_1.enumToMap)(exports$1.METHODS);
-		exports$1.H_METHOD_MAP = Object.fromEntries(Object.entries(exports$1.METHODS).filter(([k]) => k.startsWith('H')));
-		exports$1.STATUSES_HTTP = [
-		    exports$1.STATUSES.CONTINUE,
-		    exports$1.STATUSES.SWITCHING_PROTOCOLS,
-		    exports$1.STATUSES.PROCESSING,
-		    exports$1.STATUSES.EARLY_HINTS,
-		    exports$1.STATUSES.RESPONSE_IS_STALE,
-		    exports$1.STATUSES.REVALIDATION_FAILED,
-		    exports$1.STATUSES.DISCONNECTED_OPERATION,
-		    exports$1.STATUSES.HEURISTIC_EXPIRATION,
-		    exports$1.STATUSES.MISCELLANEOUS_WARNING,
-		    exports$1.STATUSES.OK,
-		    exports$1.STATUSES.CREATED,
-		    exports$1.STATUSES.ACCEPTED,
-		    exports$1.STATUSES.NON_AUTHORITATIVE_INFORMATION,
-		    exports$1.STATUSES.NO_CONTENT,
-		    exports$1.STATUSES.RESET_CONTENT,
-		    exports$1.STATUSES.PARTIAL_CONTENT,
-		    exports$1.STATUSES.MULTI_STATUS,
-		    exports$1.STATUSES.ALREADY_REPORTED,
-		    exports$1.STATUSES.TRANSFORMATION_APPLIED,
-		    exports$1.STATUSES.IM_USED,
-		    exports$1.STATUSES.MISCELLANEOUS_PERSISTENT_WARNING,
-		    exports$1.STATUSES.MULTIPLE_CHOICES,
-		    exports$1.STATUSES.MOVED_PERMANENTLY,
-		    exports$1.STATUSES.FOUND,
-		    exports$1.STATUSES.SEE_OTHER,
-		    exports$1.STATUSES.NOT_MODIFIED,
-		    exports$1.STATUSES.USE_PROXY,
-		    exports$1.STATUSES.SWITCH_PROXY,
-		    exports$1.STATUSES.TEMPORARY_REDIRECT,
-		    exports$1.STATUSES.PERMANENT_REDIRECT,
-		    exports$1.STATUSES.BAD_REQUEST,
-		    exports$1.STATUSES.UNAUTHORIZED,
-		    exports$1.STATUSES.PAYMENT_REQUIRED,
-		    exports$1.STATUSES.FORBIDDEN,
-		    exports$1.STATUSES.NOT_FOUND,
-		    exports$1.STATUSES.METHOD_NOT_ALLOWED,
-		    exports$1.STATUSES.NOT_ACCEPTABLE,
-		    exports$1.STATUSES.PROXY_AUTHENTICATION_REQUIRED,
-		    exports$1.STATUSES.REQUEST_TIMEOUT,
-		    exports$1.STATUSES.CONFLICT,
-		    exports$1.STATUSES.GONE,
-		    exports$1.STATUSES.LENGTH_REQUIRED,
-		    exports$1.STATUSES.PRECONDITION_FAILED,
-		    exports$1.STATUSES.PAYLOAD_TOO_LARGE,
-		    exports$1.STATUSES.URI_TOO_LONG,
-		    exports$1.STATUSES.UNSUPPORTED_MEDIA_TYPE,
-		    exports$1.STATUSES.RANGE_NOT_SATISFIABLE,
-		    exports$1.STATUSES.EXPECTATION_FAILED,
-		    exports$1.STATUSES.IM_A_TEAPOT,
-		    exports$1.STATUSES.PAGE_EXPIRED,
-		    exports$1.STATUSES.ENHANCE_YOUR_CALM,
-		    exports$1.STATUSES.MISDIRECTED_REQUEST,
-		    exports$1.STATUSES.UNPROCESSABLE_ENTITY,
-		    exports$1.STATUSES.LOCKED,
-		    exports$1.STATUSES.FAILED_DEPENDENCY,
-		    exports$1.STATUSES.TOO_EARLY,
-		    exports$1.STATUSES.UPGRADE_REQUIRED,
-		    exports$1.STATUSES.PRECONDITION_REQUIRED,
-		    exports$1.STATUSES.TOO_MANY_REQUESTS,
-		    exports$1.STATUSES.REQUEST_HEADER_FIELDS_TOO_LARGE_UNOFFICIAL,
-		    exports$1.STATUSES.REQUEST_HEADER_FIELDS_TOO_LARGE,
-		    exports$1.STATUSES.LOGIN_TIMEOUT,
-		    exports$1.STATUSES.NO_RESPONSE,
-		    exports$1.STATUSES.RETRY_WITH,
-		    exports$1.STATUSES.BLOCKED_BY_PARENTAL_CONTROL,
-		    exports$1.STATUSES.UNAVAILABLE_FOR_LEGAL_REASONS,
-		    exports$1.STATUSES.CLIENT_CLOSED_LOAD_BALANCED_REQUEST,
-		    exports$1.STATUSES.INVALID_X_FORWARDED_FOR,
-		    exports$1.STATUSES.REQUEST_HEADER_TOO_LARGE,
-		    exports$1.STATUSES.SSL_CERTIFICATE_ERROR,
-		    exports$1.STATUSES.SSL_CERTIFICATE_REQUIRED,
-		    exports$1.STATUSES.HTTP_REQUEST_SENT_TO_HTTPS_PORT,
-		    exports$1.STATUSES.INVALID_TOKEN,
-		    exports$1.STATUSES.CLIENT_CLOSED_REQUEST,
-		    exports$1.STATUSES.INTERNAL_SERVER_ERROR,
-		    exports$1.STATUSES.NOT_IMPLEMENTED,
-		    exports$1.STATUSES.BAD_GATEWAY,
-		    exports$1.STATUSES.SERVICE_UNAVAILABLE,
-		    exports$1.STATUSES.GATEWAY_TIMEOUT,
-		    exports$1.STATUSES.HTTP_VERSION_NOT_SUPPORTED,
-		    exports$1.STATUSES.VARIANT_ALSO_NEGOTIATES,
-		    exports$1.STATUSES.INSUFFICIENT_STORAGE,
-		    exports$1.STATUSES.LOOP_DETECTED,
-		    exports$1.STATUSES.BANDWIDTH_LIMIT_EXCEEDED,
-		    exports$1.STATUSES.NOT_EXTENDED,
-		    exports$1.STATUSES.NETWORK_AUTHENTICATION_REQUIRED,
-		    exports$1.STATUSES.WEB_SERVER_UNKNOWN_ERROR,
-		    exports$1.STATUSES.WEB_SERVER_IS_DOWN,
-		    exports$1.STATUSES.CONNECTION_TIMEOUT,
-		    exports$1.STATUSES.ORIGIN_IS_UNREACHABLE,
-		    exports$1.STATUSES.TIMEOUT_OCCURED,
-		    exports$1.STATUSES.SSL_HANDSHAKE_FAILED,
-		    exports$1.STATUSES.INVALID_SSL_CERTIFICATE,
-		    exports$1.STATUSES.RAILGUN_ERROR,
-		    exports$1.STATUSES.SITE_IS_OVERLOADED,
-		    exports$1.STATUSES.SITE_IS_FROZEN,
-		    exports$1.STATUSES.IDENTITY_PROVIDER_AUTHENTICATION_ERROR,
-		    exports$1.STATUSES.NETWORK_READ_TIMEOUT,
-		    exports$1.STATUSES.NETWORK_CONNECT_TIMEOUT,
+		exports.METHOD_MAP = (0, utils_1.enumToMap)(exports.METHODS);
+		exports.H_METHOD_MAP = Object.fromEntries(Object.entries(exports.METHODS).filter(([k]) => k.startsWith('H')));
+		exports.STATUSES_HTTP = [
+		    exports.STATUSES.CONTINUE,
+		    exports.STATUSES.SWITCHING_PROTOCOLS,
+		    exports.STATUSES.PROCESSING,
+		    exports.STATUSES.EARLY_HINTS,
+		    exports.STATUSES.RESPONSE_IS_STALE,
+		    exports.STATUSES.REVALIDATION_FAILED,
+		    exports.STATUSES.DISCONNECTED_OPERATION,
+		    exports.STATUSES.HEURISTIC_EXPIRATION,
+		    exports.STATUSES.MISCELLANEOUS_WARNING,
+		    exports.STATUSES.OK,
+		    exports.STATUSES.CREATED,
+		    exports.STATUSES.ACCEPTED,
+		    exports.STATUSES.NON_AUTHORITATIVE_INFORMATION,
+		    exports.STATUSES.NO_CONTENT,
+		    exports.STATUSES.RESET_CONTENT,
+		    exports.STATUSES.PARTIAL_CONTENT,
+		    exports.STATUSES.MULTI_STATUS,
+		    exports.STATUSES.ALREADY_REPORTED,
+		    exports.STATUSES.TRANSFORMATION_APPLIED,
+		    exports.STATUSES.IM_USED,
+		    exports.STATUSES.MISCELLANEOUS_PERSISTENT_WARNING,
+		    exports.STATUSES.MULTIPLE_CHOICES,
+		    exports.STATUSES.MOVED_PERMANENTLY,
+		    exports.STATUSES.FOUND,
+		    exports.STATUSES.SEE_OTHER,
+		    exports.STATUSES.NOT_MODIFIED,
+		    exports.STATUSES.USE_PROXY,
+		    exports.STATUSES.SWITCH_PROXY,
+		    exports.STATUSES.TEMPORARY_REDIRECT,
+		    exports.STATUSES.PERMANENT_REDIRECT,
+		    exports.STATUSES.BAD_REQUEST,
+		    exports.STATUSES.UNAUTHORIZED,
+		    exports.STATUSES.PAYMENT_REQUIRED,
+		    exports.STATUSES.FORBIDDEN,
+		    exports.STATUSES.NOT_FOUND,
+		    exports.STATUSES.METHOD_NOT_ALLOWED,
+		    exports.STATUSES.NOT_ACCEPTABLE,
+		    exports.STATUSES.PROXY_AUTHENTICATION_REQUIRED,
+		    exports.STATUSES.REQUEST_TIMEOUT,
+		    exports.STATUSES.CONFLICT,
+		    exports.STATUSES.GONE,
+		    exports.STATUSES.LENGTH_REQUIRED,
+		    exports.STATUSES.PRECONDITION_FAILED,
+		    exports.STATUSES.PAYLOAD_TOO_LARGE,
+		    exports.STATUSES.URI_TOO_LONG,
+		    exports.STATUSES.UNSUPPORTED_MEDIA_TYPE,
+		    exports.STATUSES.RANGE_NOT_SATISFIABLE,
+		    exports.STATUSES.EXPECTATION_FAILED,
+		    exports.STATUSES.IM_A_TEAPOT,
+		    exports.STATUSES.PAGE_EXPIRED,
+		    exports.STATUSES.ENHANCE_YOUR_CALM,
+		    exports.STATUSES.MISDIRECTED_REQUEST,
+		    exports.STATUSES.UNPROCESSABLE_ENTITY,
+		    exports.STATUSES.LOCKED,
+		    exports.STATUSES.FAILED_DEPENDENCY,
+		    exports.STATUSES.TOO_EARLY,
+		    exports.STATUSES.UPGRADE_REQUIRED,
+		    exports.STATUSES.PRECONDITION_REQUIRED,
+		    exports.STATUSES.TOO_MANY_REQUESTS,
+		    exports.STATUSES.REQUEST_HEADER_FIELDS_TOO_LARGE_UNOFFICIAL,
+		    exports.STATUSES.REQUEST_HEADER_FIELDS_TOO_LARGE,
+		    exports.STATUSES.LOGIN_TIMEOUT,
+		    exports.STATUSES.NO_RESPONSE,
+		    exports.STATUSES.RETRY_WITH,
+		    exports.STATUSES.BLOCKED_BY_PARENTAL_CONTROL,
+		    exports.STATUSES.UNAVAILABLE_FOR_LEGAL_REASONS,
+		    exports.STATUSES.CLIENT_CLOSED_LOAD_BALANCED_REQUEST,
+		    exports.STATUSES.INVALID_X_FORWARDED_FOR,
+		    exports.STATUSES.REQUEST_HEADER_TOO_LARGE,
+		    exports.STATUSES.SSL_CERTIFICATE_ERROR,
+		    exports.STATUSES.SSL_CERTIFICATE_REQUIRED,
+		    exports.STATUSES.HTTP_REQUEST_SENT_TO_HTTPS_PORT,
+		    exports.STATUSES.INVALID_TOKEN,
+		    exports.STATUSES.CLIENT_CLOSED_REQUEST,
+		    exports.STATUSES.INTERNAL_SERVER_ERROR,
+		    exports.STATUSES.NOT_IMPLEMENTED,
+		    exports.STATUSES.BAD_GATEWAY,
+		    exports.STATUSES.SERVICE_UNAVAILABLE,
+		    exports.STATUSES.GATEWAY_TIMEOUT,
+		    exports.STATUSES.HTTP_VERSION_NOT_SUPPORTED,
+		    exports.STATUSES.VARIANT_ALSO_NEGOTIATES,
+		    exports.STATUSES.INSUFFICIENT_STORAGE,
+		    exports.STATUSES.LOOP_DETECTED,
+		    exports.STATUSES.BANDWIDTH_LIMIT_EXCEEDED,
+		    exports.STATUSES.NOT_EXTENDED,
+		    exports.STATUSES.NETWORK_AUTHENTICATION_REQUIRED,
+		    exports.STATUSES.WEB_SERVER_UNKNOWN_ERROR,
+		    exports.STATUSES.WEB_SERVER_IS_DOWN,
+		    exports.STATUSES.CONNECTION_TIMEOUT,
+		    exports.STATUSES.ORIGIN_IS_UNREACHABLE,
+		    exports.STATUSES.TIMEOUT_OCCURED,
+		    exports.STATUSES.SSL_HANDSHAKE_FAILED,
+		    exports.STATUSES.INVALID_SSL_CERTIFICATE,
+		    exports.STATUSES.RAILGUN_ERROR,
+		    exports.STATUSES.SITE_IS_OVERLOADED,
+		    exports.STATUSES.SITE_IS_FROZEN,
+		    exports.STATUSES.IDENTITY_PROVIDER_AUTHENTICATION_ERROR,
+		    exports.STATUSES.NETWORK_READ_TIMEOUT,
+		    exports.STATUSES.NETWORK_CONNECT_TIMEOUT,
 		];
-		exports$1.ALPHA = [];
+		exports.ALPHA = [];
 		for (let i = 'A'.charCodeAt(0); i <= 'Z'.charCodeAt(0); i++) {
 		    // Upper case
-		    exports$1.ALPHA.push(String.fromCharCode(i));
+		    exports.ALPHA.push(String.fromCharCode(i));
 		    // Lower case
-		    exports$1.ALPHA.push(String.fromCharCode(i + 0x20));
+		    exports.ALPHA.push(String.fromCharCode(i + 0x20));
 		}
-		exports$1.NUM_MAP = {
+		exports.NUM_MAP = {
 		    0: 0, 1: 1, 2: 2, 3: 3, 4: 4,
 		    5: 5, 6: 6, 7: 7, 8: 8, 9: 9,
 		};
-		exports$1.HEX_MAP = {
+		exports.HEX_MAP = {
 		    0: 0, 1: 1, 2: 2, 3: 3, 4: 4,
 		    5: 5, 6: 6, 7: 7, 8: 8, 9: 9,
 		    A: 0XA, B: 0XB, C: 0XC, D: 0XD, E: 0XE, F: 0XF,
 		    a: 0xa, b: 0xb, c: 0xc, d: 0xd, e: 0xe, f: 0xf,
 		};
-		exports$1.NUM = [
+		exports.NUM = [
 		    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
 		];
-		exports$1.ALPHANUM = exports$1.ALPHA.concat(exports$1.NUM);
-		exports$1.MARK = ['-', '_', '.', '!', '~', '*', '\'', '(', ')'];
-		exports$1.USERINFO_CHARS = exports$1.ALPHANUM
-		    .concat(exports$1.MARK)
+		exports.ALPHANUM = exports.ALPHA.concat(exports.NUM);
+		exports.MARK = ['-', '_', '.', '!', '~', '*', '\'', '(', ')'];
+		exports.USERINFO_CHARS = exports.ALPHANUM
+		    .concat(exports.MARK)
 		    .concat(['%', ';', ':', '&', '=', '+', '$', ',']);
 		// TODO(indutny): use RFC
-		exports$1.URL_CHAR = [
+		exports.URL_CHAR = [
 		    '!', '"', '$', '%', '&', '\'',
 		    '(', ')', '*', '+', ',', '-', '.', '/',
 		    ':', ';', '<', '=', '>',
 		    '@', '[', '\\', ']', '^', '_',
 		    '`',
 		    '{', '|', '}', '~',
-		].concat(exports$1.ALPHANUM);
-		exports$1.HEX = exports$1.NUM.concat(['a', 'b', 'c', 'd', 'e', 'f', 'A', 'B', 'C', 'D', 'E', 'F']);
+		].concat(exports.ALPHANUM);
+		exports.HEX = exports.NUM.concat(['a', 'b', 'c', 'd', 'e', 'f', 'A', 'B', 'C', 'D', 'E', 'F']);
 		/* Tokens as defined by rfc 2616. Also lowercases them.
 		 *        token       = 1*<any CHAR except CTLs or separators>
 		 *     separators     = "(" | ")" | "<" | ">" | "@"
@@ -4455,80 +4630,80 @@ function requireConstants$3 () {
 		 *                    | "/" | "[" | "]" | "?" | "="
 		 *                    | "{" | "}" | SP | HT
 		 */
-		exports$1.TOKEN = [
+		exports.TOKEN = [
 		    '!', '#', '$', '%', '&', '\'',
 		    '*', '+', '-', '.',
 		    '^', '_', '`',
 		    '|', '~',
-		].concat(exports$1.ALPHANUM);
+		].concat(exports.ALPHANUM);
 		/*
 		 * Verify that a char is a valid visible (printable) US-ASCII
 		 * character or %x80-FF
 		 */
-		exports$1.HEADER_CHARS = ['\t'];
+		exports.HEADER_CHARS = ['\t'];
 		for (let i = 32; i <= 255; i++) {
 		    if (i !== 127) {
-		        exports$1.HEADER_CHARS.push(i);
+		        exports.HEADER_CHARS.push(i);
 		    }
 		}
 		// ',' = \x44
-		exports$1.CONNECTION_TOKEN_CHARS = exports$1.HEADER_CHARS.filter((c) => c !== 44);
-		exports$1.QUOTED_STRING = ['\t', ' '];
+		exports.CONNECTION_TOKEN_CHARS = exports.HEADER_CHARS.filter((c) => c !== 44);
+		exports.QUOTED_STRING = ['\t', ' '];
 		for (let i = 0x21; i <= 0xff; i++) {
 		    if (i !== 0x22 && i !== 0x5c) { // All characters in ASCII except \ and "
-		        exports$1.QUOTED_STRING.push(i);
+		        exports.QUOTED_STRING.push(i);
 		    }
 		}
-		exports$1.HTAB_SP_VCHAR_OBS_TEXT = ['\t', ' '];
+		exports.HTAB_SP_VCHAR_OBS_TEXT = ['\t', ' '];
 		// VCHAR: https://tools.ietf.org/html/rfc5234#appendix-B.1
 		for (let i = 0x21; i <= 0x7E; i++) {
-		    exports$1.HTAB_SP_VCHAR_OBS_TEXT.push(i);
+		    exports.HTAB_SP_VCHAR_OBS_TEXT.push(i);
 		}
 		// OBS_TEXT: https://datatracker.ietf.org/doc/html/rfc9110#name-collected-abnf
 		for (let i = 0x80; i <= 0xff; i++) {
-		    exports$1.HTAB_SP_VCHAR_OBS_TEXT.push(i);
+		    exports.HTAB_SP_VCHAR_OBS_TEXT.push(i);
 		}
-		exports$1.MAJOR = exports$1.NUM_MAP;
-		exports$1.MINOR = exports$1.MAJOR;
-		exports$1.SPECIAL_HEADERS = {
-		    'connection': exports$1.HEADER_STATE.CONNECTION,
-		    'content-length': exports$1.HEADER_STATE.CONTENT_LENGTH,
-		    'proxy-connection': exports$1.HEADER_STATE.CONNECTION,
-		    'transfer-encoding': exports$1.HEADER_STATE.TRANSFER_ENCODING,
-		    'upgrade': exports$1.HEADER_STATE.UPGRADE,
+		exports.MAJOR = exports.NUM_MAP;
+		exports.MINOR = exports.MAJOR;
+		exports.SPECIAL_HEADERS = {
+		    'connection': exports.HEADER_STATE.CONNECTION,
+		    'content-length': exports.HEADER_STATE.CONTENT_LENGTH,
+		    'proxy-connection': exports.HEADER_STATE.CONNECTION,
+		    'transfer-encoding': exports.HEADER_STATE.TRANSFER_ENCODING,
+		    'upgrade': exports.HEADER_STATE.UPGRADE,
 		};
-		exports$1.default = {
-		    ERROR: exports$1.ERROR,
-		    TYPE: exports$1.TYPE,
-		    FLAGS: exports$1.FLAGS,
-		    LENIENT_FLAGS: exports$1.LENIENT_FLAGS,
-		    METHODS: exports$1.METHODS,
-		    STATUSES: exports$1.STATUSES,
-		    FINISH: exports$1.FINISH,
-		    HEADER_STATE: exports$1.HEADER_STATE,
-		    ALPHA: exports$1.ALPHA,
-		    NUM_MAP: exports$1.NUM_MAP,
-		    HEX_MAP: exports$1.HEX_MAP,
-		    NUM: exports$1.NUM,
-		    ALPHANUM: exports$1.ALPHANUM,
-		    MARK: exports$1.MARK,
-		    USERINFO_CHARS: exports$1.USERINFO_CHARS,
-		    URL_CHAR: exports$1.URL_CHAR,
-		    HEX: exports$1.HEX,
-		    TOKEN: exports$1.TOKEN,
-		    HEADER_CHARS: exports$1.HEADER_CHARS,
-		    CONNECTION_TOKEN_CHARS: exports$1.CONNECTION_TOKEN_CHARS,
-		    QUOTED_STRING: exports$1.QUOTED_STRING,
-		    HTAB_SP_VCHAR_OBS_TEXT: exports$1.HTAB_SP_VCHAR_OBS_TEXT,
-		    MAJOR: exports$1.MAJOR,
-		    MINOR: exports$1.MINOR,
-		    SPECIAL_HEADERS: exports$1.SPECIAL_HEADERS,
-		    METHODS_HTTP: exports$1.METHODS_HTTP,
-		    METHODS_ICE: exports$1.METHODS_ICE,
-		    METHODS_RTSP: exports$1.METHODS_RTSP,
-		    METHOD_MAP: exports$1.METHOD_MAP,
-		    H_METHOD_MAP: exports$1.H_METHOD_MAP,
-		    STATUSES_HTTP: exports$1.STATUSES_HTTP,
+		exports.default = {
+		    ERROR: exports.ERROR,
+		    TYPE: exports.TYPE,
+		    FLAGS: exports.FLAGS,
+		    LENIENT_FLAGS: exports.LENIENT_FLAGS,
+		    METHODS: exports.METHODS,
+		    STATUSES: exports.STATUSES,
+		    FINISH: exports.FINISH,
+		    HEADER_STATE: exports.HEADER_STATE,
+		    ALPHA: exports.ALPHA,
+		    NUM_MAP: exports.NUM_MAP,
+		    HEX_MAP: exports.HEX_MAP,
+		    NUM: exports.NUM,
+		    ALPHANUM: exports.ALPHANUM,
+		    MARK: exports.MARK,
+		    USERINFO_CHARS: exports.USERINFO_CHARS,
+		    URL_CHAR: exports.URL_CHAR,
+		    HEX: exports.HEX,
+		    TOKEN: exports.TOKEN,
+		    HEADER_CHARS: exports.HEADER_CHARS,
+		    CONNECTION_TOKEN_CHARS: exports.CONNECTION_TOKEN_CHARS,
+		    QUOTED_STRING: exports.QUOTED_STRING,
+		    HTAB_SP_VCHAR_OBS_TEXT: exports.HTAB_SP_VCHAR_OBS_TEXT,
+		    MAJOR: exports.MAJOR,
+		    MINOR: exports.MINOR,
+		    SPECIAL_HEADERS: exports.SPECIAL_HEADERS,
+		    METHODS_HTTP: exports.METHODS_HTTP,
+		    METHODS_ICE: exports.METHODS_ICE,
+		    METHODS_RTSP: exports.METHODS_RTSP,
+		    METHOD_MAP: exports.METHOD_MAP,
+		    H_METHOD_MAP: exports.H_METHOD_MAP,
+		    STATUSES_HTTP: exports.STATUSES_HTTP,
 		}; 
 	} (constants$3));
 	return constants$3;
@@ -4825,7 +5000,7 @@ function requireInfra () {
 	if (hasRequiredInfra) return infra;
 	hasRequiredInfra = 1;
 
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { utf8DecodeBytes } = requireEncoding();
 
 	/**
@@ -5062,7 +5237,7 @@ function requireDataUrl () {
 	if (hasRequiredDataUrl) return dataUrl;
 	hasRequiredDataUrl = 1;
 
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { forgivingBase64, collectASequenceOfCodePoints, collectASequenceOfCodePointsFast, isomorphicDecode, removeASCIIWhitespace, removeChars } = requireInfra();
 
 	const encoder = new TextEncoder();
@@ -5673,7 +5848,7 @@ function requireRuntimeFeatures () {
 	const lazyLoaders = {
 	  __proto__: null,
 	  'node:crypto': () => require$$2$2,
-	  'node:sqlite': () => require$$1$1,
+	  'node:sqlite': () => require$$1$2,
 	  'node:worker_threads': () => require$$2$1,
 	  'node:zlib': () => require$$3$1
 	};
@@ -5799,7 +5974,7 @@ function requireWebidl () {
 	if (hasRequiredWebidl) return webidl_1;
 	hasRequiredWebidl = 1;
 
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { types, inspect } = require$$3;
 	const { runtimeFeatures } = requireRuntimeFeatures();
 
@@ -5989,10 +6164,10 @@ function requireWebidl () {
 	  } else {
 	    // 3. Otherwise:
 
-	    // 1. Let lowerBound be -2^bitLength − 1.
-	    lowerBound = Math.pow(-2, bitLength) - 1;
+	    // 1. Let lowerBound be -2^(bitLength − 1).
+	    lowerBound = -Math.pow(2, bitLength - 1);
 
-	    // 2. Let upperBound be 2^bitLength − 1 − 1.
+	    // 2. Let upperBound be 2^(bitLength − 1) − 1.
 	    upperBound = Math.pow(2, bitLength - 1) - 1;
 	  }
 
@@ -6071,9 +6246,9 @@ function requireWebidl () {
 	  // 10. Set x to x modulo 2^bitLength.
 	  x = x % Math.pow(2, bitLength);
 
-	  // 11. If signedness is "signed" and x ≥ 2^bitLength − 1,
+	  // 11. If signedness is "signed" and x ≥ 2^(bitLength − 1),
 	  //    then return x − 2^bitLength.
-	  if (signedness === 'signed' && x >= Math.pow(2, bitLength) - 1) {
+	  if (signedness === 'signed' && x >= Math.pow(2, bitLength - 1)) {
 	    return x - Math.pow(2, bitLength)
 	  }
 
@@ -6251,6 +6426,9 @@ function requireWebidl () {
 	};
 
 	webidl.dictionaryConverter = function (converters) {
+	  // "For each dictionary member member declared on dictionary, in lexicographical order:"
+	  converters.sort((a, b) => (a.key > b.key) - (a.key < b.key));
+
 	  return (dictionary, prefix, argument) => {
 	    const dict = {};
 
@@ -6810,14 +6988,14 @@ function requireUtil$4 () {
 	if (hasRequiredUtil$4) return util$4;
 	hasRequiredUtil$4 = 1;
 
-	const { Transform } = require$$0$1;
+	const { Transform } = require$$0$2;
 	const zlib = require$$3$1;
 	const { redirectStatusSet, referrerPolicyTokens, badPortsSet } = requireConstants$2();
 	const { getGlobalOrigin } = requireGlobal$1();
 	const { collectAnHTTPQuotedString, parseMIMEType } = requireDataUrl();
 	const { performance } = require$$5$1;
 	const { ReadableStreamFrom, isValidHTTPToken, normalizedMethodRecordsBase } = requireUtil$5();
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { isUint8Array } = require$$8;
 	const { webidl } = requireWebidl();
 	const { isomorphicEncode, collectASequenceOfCodePoints, removeChars } = requireInfra();
@@ -8256,8 +8434,10 @@ function requireUtil$4 () {
 	 * @param {object|string} navigable
 	 */
 	function isTraversableNavigable (navigable) {
-	  // TODO
-	  return true
+	  // Returns true only if we have an actual traversable navigable object
+	  // that can prompt the user for credentials. In Node.js, this will always
+	  // be false since there's no Window object or navigable.
+	  return navigable != null && navigable !== 'client' && navigable !== 'no-traversable'
 	}
 
 	class EnvironmentSettingsObjectBase {
@@ -8606,12 +8786,12 @@ function requireFormdataParser () {
 	const { HTTP_TOKEN_CODEPOINTS } = requireDataUrl();
 	const { makeEntry } = requireFormdata();
 	const { webidl } = requireWebidl();
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { isomorphicDecode } = requireInfra();
-	const { utf8DecodeBytes } = requireEncoding();
 
 	const dd = Buffer.from('--');
 	const decoder = new TextDecoder();
+	const decoderIgnoreBOM = new TextDecoder('utf-8', { ignoreBOM: true });
 
 	/**
 	 * @param {string} chars
@@ -8790,7 +8970,7 @@ function requireFormdataParser () {
 	      // 5.11. Otherwise:
 
 	      // 5.11.1. Let value be the UTF-8 decoding without BOM of body.
-	      value = utf8DecodeBytes(Buffer.from(body));
+	      value = decoderIgnoreBOM.decode(Buffer.from(body));
 	    }
 
 	    // 5.12. Assert: name is a scalar value string and value is either a scalar value string or a File object.
@@ -8806,7 +8986,7 @@ function requireFormdataParser () {
 	 * Parses content-disposition attributes (e.g., name="value" or filename*=utf-8''encoded)
 	 * @param {Buffer} input
 	 * @param {{ position: number }} position
-	 * @returns {{ name: string, value: string }}
+	 * @returns {{ name: string, value: string, extended: boolean } | null}
 	 */
 	function parseContentDispositionAttribute (input, position) {
 	  // Skip leading semicolon and whitespace
@@ -8906,7 +9086,7 @@ function requireFormdataParser () {
 	    value = decoder.decode(tokenValue);
 	  }
 
-	  return { name: attrNameStr, value }
+	  return { name: attrNameStr, value, extended: isExtended }
 	}
 
 	/**
@@ -8970,6 +9150,9 @@ function requireFormdataParser () {
 	    switch (bufferToLowerCasedHeaderName(headerName)) {
 	      case 'content-disposition': {
 	        name = filename = null;
+	        // Track whether filename was set from the extended (RFC 5987) form so
+	        // a subsequent legacy `filename` attribute does not override it.
+	        let filenameIsExtended = false;
 
 	        // Collect the disposition type (should be "form-data")
 	        const dispositionType = collectASequenceOfBytes(
@@ -8985,8 +9168,8 @@ function requireFormdataParser () {
 	        // Parse attributes recursively until CRLF
 	        while (
 	          position.position < input.length &&
-	          input[position.position] !== 0x0d &&
-	          input[position.position + 1] !== 0x0a
+	          (input[position.position] !== 0x0d ||
+	          input[position.position + 1] !== 0x0a)
 	        ) {
 	          const attribute = parseContentDispositionAttribute(input, position);
 
@@ -8997,7 +9180,15 @@ function requireFormdataParser () {
 	          if (attribute.name === 'name') {
 	            name = attribute.value;
 	          } else if (attribute.name === 'filename') {
-	            filename = attribute.value;
+	            // Per RFC 5987 §4.1, when both legacy and extended forms of the
+	            // same parameter are present, the extended (filename*) form takes
+	            // precedence regardless of the order they appear in.
+	            if (attribute.extended) {
+	              filename = attribute.value;
+	              filenameIsExtended = true;
+	            } else if (!filenameIsExtended) {
+	              filename = attribute.value;
+	            }
 	          }
 	        }
 
@@ -9050,7 +9241,7 @@ function requireFormdataParser () {
 
 	    // 2.9. If position does not point to a sequence of bytes starting with 0x0D 0x0A
 	    //      (CR LF), return failure. Otherwise, advance position by 2 (past the newline).
-	    if (input[position.position] !== 0x0d && input[position.position + 1] !== 0x0a) {
+	    if (input[position.position] !== 0x0d || input[position.position + 1] !== 0x0a) {
 	      throw parsingError('expected CRLF')
 	    } else {
 	      position.position += 2;
@@ -9230,8 +9421,8 @@ function requireBody () {
 	} = requireUtil$4();
 	const { FormData, setFormDataState } = requireFormdata();
 	const { webidl } = requireWebidl();
-	const assert = require$$0;
-	const { isErrored, isDisturbed } = require$$0$1;
+	const assert = require$$0$1;
+	const { isErrored, isDisturbed } = require$$0$2;
 	const { isUint8Array } = require$$8;
 	const { serializeAMimeType } = requireDataUrl();
 	const { multipartFormDataParser } = requireFormdataParser();
@@ -9740,7 +9931,7 @@ function requireClientH1 () {
 
 	/* global WebAssembly */
 
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const util = requireUtil$5();
 	const { channels } = requireDiagnostics();
 	const timers = requireTimers();
@@ -9748,6 +9939,7 @@ function requireClientH1 () {
 	  RequestContentLengthMismatchError,
 	  ResponseContentLengthMismatchError,
 	  RequestAbortedError,
+	  InvalidArgumentError,
 	  HeadersTimeoutError,
 	  HeadersOverflowError,
 	  SocketError,
@@ -9795,6 +9987,9 @@ function requireClientH1 () {
 	const EMPTY_BUF = Buffer.alloc(0);
 	const FastBuffer = Buffer[Symbol.species];
 	const removeAllListeners = util.removeAllListeners;
+	const kIdleSocketValidation = Symbol('kIdleSocketValidation');
+	const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout');
+	const kSocketUsed = Symbol('kSocketUsed');
 
 	let extractBody;
 
@@ -9807,9 +10002,9 @@ function requireClientH1 () {
 	  let useWasmSIMD = process.arch !== 'ppc64';
 	  // The Env Variable UNDICI_NO_WASM_SIMD allows explicitly overriding the default behavior
 	  if (process.env.UNDICI_NO_WASM_SIMD === '1') {
-	    useWasmSIMD = true;
-	  } else if (process.env.UNDICI_NO_WASM_SIMD === '0') {
 	    useWasmSIMD = false;
+	  } else if (process.env.UNDICI_NO_WASM_SIMD === '0') {
+	    useWasmSIMD = true;
 	  }
 
 	  if (useWasmSIMD) {
@@ -9945,8 +10140,8 @@ function requireClientH1 () {
 	     * @param {import('net').Socket} socket
 	     * @param {*} llhttp
 	     */
-	  constructor (client, socket, { exports: exports$1 }) {
-	    this.llhttp = exports$1;
+	  constructor (client, socket, { exports }) {
+	    this.llhttp = exports;
 	    this.ptr = this.llhttp.llhttp_alloc(constants.TYPE.RESPONSE);
 	    this.client = client;
 	    /**
@@ -9954,6 +10149,7 @@ function requireClientH1 () {
 	     */
 	    this.socket = socket;
 	    this.timeout = null;
+	    this.timeoutWeakRef = new WeakRef(this);
 	    this.timeoutValue = null;
 	    this.timeoutType = null;
 	    this.statusCode = 0;
@@ -9991,9 +10187,9 @@ function requireClientH1 () {
 
 	      if (delay) {
 	        if (type & USE_FAST_TIMER) {
-	          this.timeout = timers.setFastTimeout(onParserTimeout, delay, new WeakRef(this));
+	          this.timeout = timers.setFastTimeout(onParserTimeout, delay, this.timeoutWeakRef);
 	        } else {
-	          this.timeout = setTimeout(onParserTimeout, delay, new WeakRef(this));
+	          this.timeout = setTimeout(onParserTimeout, delay, this.timeoutWeakRef);
 	          this.timeout?.unref();
 	        }
 	      }
@@ -10087,21 +10283,60 @@ function requireClientH1 () {
 	          this.paused = true;
 	          socket.unshift(data);
 	        } else {
-	          const ptr = llhttp.llhttp_get_error_reason(this.ptr);
-	          let message = '';
-	          if (ptr) {
-	            const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0);
-	            message =
-	              'Response does not match the HTTP/1.1 protocol (' +
-	              Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-	              ')';
-	          }
-	          throw new HTTPParserError(message, constants.ERROR[ret], data)
+	          throw this.createError(ret, data)
 	        }
 	      }
 	    } catch (err) {
 	      util.destroy(socket, err);
 	    }
+	  }
+
+	  finish () {
+	    assert(currentParser === null);
+	    assert(this.ptr != null);
+	    assert(!this.paused);
+
+	    const { llhttp } = this;
+
+	    let ret;
+
+	    try {
+	      currentParser = this;
+	      ret = llhttp.llhttp_finish(this.ptr);
+	    } finally {
+	      currentParser = null;
+	    }
+
+	    if (ret === constants.ERROR.OK) {
+	      return null
+	    }
+
+	    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+	      this.paused = true;
+	      return null
+	    }
+
+	    return this.createError(ret, EMPTY_BUF)
+	  }
+
+	  createError (ret, data) {
+	    const { llhttp, contentLength, bytesRead } = this;
+
+	    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+	      return new ResponseContentLengthMismatchError()
+	    }
+
+	    const ptr = llhttp.llhttp_get_error_reason(this.ptr);
+	    let message = '';
+	    if (ptr) {
+	      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0);
+	      message =
+	        'Response does not match the HTTP/1.1 protocol (' +
+	        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+	        ')';
+	    }
+
+	    return new HTTPParserError(message, constants.ERROR[ret], data)
 	  }
 
 	  destroy () {
@@ -10135,6 +10370,11 @@ function requireClientH1 () {
 	    const { socket, client } = this;
 
 	    if (socket.destroyed) {
+	      return -1
+	    }
+
+	    if (client[kRunning] === 0) {
+	      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)));
 	      return -1
 	    }
 
@@ -10263,6 +10503,11 @@ function requireClientH1 () {
 	    const { client, socket, headers, statusText } = this;
 
 	    if (socket.destroyed) {
+	      return -1
+	    }
+
+	    if (client[kRunning] === 0) {
+	      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)));
 	      return -1
 	    }
 
@@ -10444,6 +10689,7 @@ function requireClientH1 () {
 	    request.onComplete(headers);
 
 	    client[kQueue][client[kRunningIdx]++] = null;
+	    socket[kSocketUsed] = client[kPending] === 0;
 
 	    if (socket[kWriting]) {
 	      assert(client[kRunning] === 0);
@@ -10520,6 +10766,9 @@ function requireClientH1 () {
 	  socket[kWriting] = false;
 	  socket[kReset] = false;
 	  socket[kBlocking] = false;
+	  socket[kIdleSocketValidation] = 0;
+	  socket[kIdleSocketValidationTimeout] = null;
+	  socket[kSocketUsed] = false;
 	  socket[kParser] = new Parser(client, socket, llhttpInstance);
 
 	  util.addListener(socket, 'error', onHttpSocketError);
@@ -10562,7 +10811,7 @@ function requireClientH1 () {
 	     * @returns {boolean}
 	     */
 	    busy (request) {
-	      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+	      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
 	        return true
 	      }
 
@@ -10608,8 +10857,11 @@ function requireClientH1 () {
 	  // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
 	  // to the user.
 	  if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-	    // We treat all incoming data so for as a valid response.
-	    parser.onMessageComplete();
+	    const parserErr = parser.finish();
+	    if (parserErr) {
+	      this[kError] = parserErr;
+	      this[kClient][kOnError](parserErr);
+	    }
 	    return
 	  }
 
@@ -10626,8 +10878,10 @@ function requireClientH1 () {
 	  const parser = this[kParser];
 
 	  if (parser.statusCode && !parser.shouldKeepAlive) {
-	    // We treat all incoming data so far as a valid response.
-	    parser.onMessageComplete();
+	    const parserErr = parser.finish();
+	    if (parserErr) {
+	      util.destroy(this, parserErr);
+	    }
 	    return
 	  }
 
@@ -10637,10 +10891,11 @@ function requireClientH1 () {
 	function onHttpSocketClose () {
 	  const parser = this[kParser];
 
+	  clearIdleSocketValidation(this);
+
 	  if (parser) {
 	    if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-	      // We treat all incoming data so far as a valid response.
-	      parser.onMessageComplete();
+	      this[kError] = parser.finish() || this[kError];
 	    }
 
 	    this[kParser].destroy();
@@ -10684,6 +10939,28 @@ function requireClientH1 () {
 	  this[kClosed] = true;
 	}
 
+	function clearIdleSocketValidation (socket) {
+	  if (socket[kIdleSocketValidationTimeout]) {
+	    clearTimeout(socket[kIdleSocketValidationTimeout]);
+	    socket[kIdleSocketValidationTimeout] = null;
+	  }
+
+	  socket[kIdleSocketValidation] = 0;
+	}
+
+	function scheduleIdleSocketValidation (client, socket) {
+	  socket[kIdleSocketValidation] = 1;
+	  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+	    socket[kIdleSocketValidationTimeout] = null;
+	    socket[kIdleSocketValidation] = 2;
+
+	    if (client[kSocket] === socket && !socket.destroyed) {
+	      client[kResume]();
+	    }
+	  }, 0);
+	  socket[kIdleSocketValidationTimeout].unref?.();
+	}
+
 	/**
 	 * @param {import('./client.js')} client
 	 */
@@ -10699,6 +10976,32 @@ function requireClientH1 () {
 	    } else if (socket[kNoRef] && socket.ref) {
 	      socket.ref();
 	      socket[kNoRef] = false;
+	    }
+
+	    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+	      if (socket[kIdleSocketValidation] === 0) {
+	        scheduleIdleSocketValidation(client, socket);
+	        socket[kParser].readMore();
+	        if (socket.destroyed) {
+	          return
+	        }
+	        return
+	      }
+
+	      if (socket[kIdleSocketValidation] === 1) {
+	        socket[kParser].readMore();
+	        if (socket.destroyed) {
+	          return
+	        }
+	        return
+	      }
+	    }
+
+	    if (client[kRunning] === 0) {
+	      socket[kParser].readMore();
+	      if (socket.destroyed) {
+	        return
+	      }
 	    }
 
 	    if (client[kSize] === 0) {
@@ -10761,8 +11064,16 @@ function requireClientH1 () {
 	    }
 	    body = bodyStream.stream;
 	    contentLength = bodyStream.length;
-	  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-	    headers.push('content-type', body.type);
+	  } else if (util.isBlobLike(body) && request.contentType == null) {
+	    const contentType = body.type;
+	    if (contentType) {
+	      const contentTypeValue = `${contentType}`;
+	      if (!util.isValidHeaderValue(contentTypeValue)) {
+	        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'));
+	        return false
+	      }
+	      headers.push('content-type', contentTypeValue);
+	    }
 	  }
 
 	  if (body && typeof body.read === 'function') {
@@ -10799,6 +11110,7 @@ function requireClientH1 () {
 	  }
 
 	  const socket = client[kSocket];
+	  clearIdleSocketValidation(socket);
 
 	  /**
 	   * @param {Error} [err]
@@ -10850,6 +11162,10 @@ function requireClientH1 () {
 
 	  if (blocking) {
 	    socket[kBlocking] = true;
+	  }
+
+	  if (socket.setTypeOfService) {
+	    socket.setTypeOfService(request.typeOfService);
 	  }
 
 	  let header = `${method} ${path} HTTP/1.1\r\n`;
@@ -11352,8 +11668,8 @@ function requireClientH2 () {
 	if (hasRequiredClientH2) return clientH2;
 	hasRequiredClientH2 = 1;
 
-	const assert = require$$0;
-	const { pipeline } = require$$0$1;
+	const assert = require$$0$1;
+	const { pipeline } = require$$0$2;
 	const util = requireUtil$5();
 	const {
 	  RequestContentLengthMismatchError,
@@ -12052,12 +12368,16 @@ function requireClientH2 () {
 	    if (request.onHeaders(Number(statusCode), parseH2Headers(realHeaders), stream.resume.bind(stream), '') === false) {
 	      stream.pause();
 	    }
-	  });
 
-	  stream.on('data', (chunk) => {
-	    if (request.onData(chunk) === false) {
-	      stream.pause();
-	    }
+	    stream.on('data', (chunk) => {
+	      if (request.aborted || request.completed) {
+	        return
+	      }
+
+	      if (request.onData(chunk) === false) {
+	        stream.pause();
+	      }
+	    });
 	  });
 
 	  stream.once('end', () => {
@@ -12119,6 +12439,7 @@ function requireClientH2 () {
 	      return
 	    }
 
+	    stream.removeAllListeners('data');
 	    request.onComplete(trailers);
 	  });
 
@@ -12350,8 +12671,8 @@ function requireClient () {
 	if (hasRequiredClient) return client;
 	hasRequiredClient = 1;
 
-	const assert = require$$0;
-	const net = require$$0$2;
+	const assert = require$$0$1;
+	const net = require$$1$1;
 	const http = require$$2;
 	const util = requireUtil$5();
 	const { ClientStats } = requireStats();
@@ -12419,7 +12740,7 @@ function requireClient () {
 	  ? () => http.maxHeaderSize
 	  : () => { throw new InvalidArgumentError('http module not available or http.maxHeaderSize invalid') };
 
-	const noop = () => {};
+	const noop = () => { };
 
 	function getPipelining (client) {
 	  return client[kPipelining] ?? client[kHTTPContext]?.defaultPipelining ?? 1
@@ -12464,7 +12785,8 @@ function requireClient () {
 	    useH2c,
 	    initialWindowSize,
 	    connectionWindowSize,
-	    pingInterval
+	    pingInterval,
+	    webSocket
 	  } = {}) {
 	    if (keepAlive !== undefined) {
 	      throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -12572,7 +12894,7 @@ function requireClient () {
 	      throw new InvalidArgumentError('pingInterval must be a positive integer, greater or equal to 0')
 	    }
 
-	    super();
+	    super({ webSocket });
 
 	    if (typeof connect !== 'function') {
 	      connect = buildConnector({
@@ -12585,6 +12907,13 @@ function requireClient () {
 	        ...(typeof autoSelectFamily === 'boolean' ? { autoSelectFamily, autoSelectFamilyAttemptTimeout } : undefined),
 	        ...connect
 	      });
+	    } else {
+	      const customConnect = connect;
+	      connect = (opts, callback) => customConnect({
+	        ...opts,
+	        ...(socketPath != null ? { socketPath } : null),
+	        ...(allowH2 != null ? { allowH2 } : null)
+	      }, callback);
 	    }
 
 	    this[kUrl] = util.parseOrigin(url);
@@ -12797,65 +13126,70 @@ function requireClient () {
 	    });
 	  }
 
-	  client[kConnector]({
-	    host,
-	    hostname,
-	    protocol,
-	    port,
-	    servername: client[kServerName],
-	    localAddress: client[kLocalAddress]
-	  }, (err, socket) => {
-	    if (err) {
-	      handleConnectError(client, err, { host, hostname, protocol, port });
+	  try {
+	    client[kConnector]({
+	      host,
+	      hostname,
+	      protocol,
+	      port,
+	      servername: client[kServerName],
+	      localAddress: client[kLocalAddress]
+	    }, (err, socket) => {
+	      if (err) {
+	        handleConnectError(client, err, { host, hostname, protocol, port });
+	        client[kResume]();
+	        return
+	      }
+
+	      if (client.destroyed) {
+	        util.destroy(socket.on('error', noop), new ClientDestroyedError());
+	        client[kResume]();
+	        return
+	      }
+
+	      assert(socket);
+
+	      try {
+	        client[kHTTPContext] = socket.alpnProtocol === 'h2'
+	          ? connectH2(client, socket)
+	          : connectH1(client, socket);
+	      } catch (err) {
+	        socket.destroy().on('error', noop);
+	        handleConnectError(client, err, { host, hostname, protocol, port });
+	        client[kResume]();
+	        return
+	      }
+
+	      client[kConnecting] = false;
+
+	      socket[kCounter] = 0;
+	      socket[kMaxRequests] = client[kMaxRequests];
+	      socket[kClient] = client;
+	      socket[kError] = null;
+
+	      if (channels.connected.hasSubscribers) {
+	        channels.connected.publish({
+	          connectParams: {
+	            host,
+	            hostname,
+	            protocol,
+	            port,
+	            version: client[kHTTPContext]?.version,
+	            servername: client[kServerName],
+	            localAddress: client[kLocalAddress]
+	          },
+	          connector: client[kConnector],
+	          socket
+	        });
+	      }
+
+	      client.emit('connect', client[kUrl], [client]);
 	      client[kResume]();
-	      return
-	    }
-
-	    if (client.destroyed) {
-	      util.destroy(socket.on('error', noop), new ClientDestroyedError());
-	      client[kResume]();
-	      return
-	    }
-
-	    assert(socket);
-
-	    try {
-	      client[kHTTPContext] = socket.alpnProtocol === 'h2'
-	        ? connectH2(client, socket)
-	        : connectH1(client, socket);
-	    } catch (err) {
-	      socket.destroy().on('error', noop);
-	      handleConnectError(client, err, { host, hostname, protocol, port });
-	      client[kResume]();
-	      return
-	    }
-
-	    client[kConnecting] = false;
-
-	    socket[kCounter] = 0;
-	    socket[kMaxRequests] = client[kMaxRequests];
-	    socket[kClient] = client;
-	    socket[kError] = null;
-
-	    if (channels.connected.hasSubscribers) {
-	      channels.connected.publish({
-	        connectParams: {
-	          host,
-	          hostname,
-	          protocol,
-	          port,
-	          version: client[kHTTPContext]?.version,
-	          servername: client[kServerName],
-	          localAddress: client[kLocalAddress]
-	        },
-	        connector: client[kConnector],
-	        socket
-	      });
-	    }
-
-	    client.emit('connect', client[kUrl], [client]);
+	    });
+	  } catch (err) {
+	    handleConnectError(client, err, { host, hostname, protocol, port });
 	    client[kResume]();
-	  });
+	  }
 	}
 
 	function handleConnectError (client, err, { host, hostname, protocol, port }) {
@@ -12954,6 +13288,10 @@ function requireClient () {
 	    }
 
 	    const request = client[kQueue][client[kPendingIdx]];
+
+	    if (request === null) {
+	      return
+	    }
 
 	    if (client[kUrl].protocol === 'https:' && client[kServerName] !== request.servername) {
 	      if (client[kRunning] > 0) {
@@ -13431,11 +13769,11 @@ function requirePool () {
 	      });
 	    }
 
-	    super();
+	    super(options);
 
 	    this[kConnections] = connections || null;
 	    this[kUrl] = util.parseOrigin(origin);
-	    this[kOptions] = { ...util.deepClone(options), connect, allowH2, clientTtl };
+	    this[kOptions] = { ...util.deepClone(options), connect, allowH2, clientTtl, socketPath };
 	    this[kOptions].interceptors = options.interceptors
 	      ? { ...options.interceptors }
 	      : undefined;
@@ -13508,7 +13846,7 @@ function requireBalancedPool () {
 	} = requirePoolBase();
 	const Pool = requirePool();
 	const { kUrl } = requireSymbols();
-	const { parseOrigin } = requireUtil$5();
+	const util = requireUtil$5();
 	const kFactory = Symbol('factory');
 
 	const kOptions = Symbol('options');
@@ -13548,9 +13886,12 @@ function requireBalancedPool () {
 	      throw new InvalidArgumentError('factory must be a function.')
 	    }
 
-	    super();
+	    super(opts);
 
-	    this[kOptions] = opts;
+	    this[kOptions] = { ...util.deepClone(opts) };
+	    this[kOptions].interceptors = opts.interceptors
+	      ? { ...opts.interceptors }
+	      : undefined;
 	    this[kIndex] = -1;
 	    this[kCurrentWeight] = 0;
 
@@ -13570,7 +13911,7 @@ function requireBalancedPool () {
 	  }
 
 	  addUpstream (upstream) {
-	    const upstreamOrigin = parseOrigin(upstream).origin;
+	    const upstreamOrigin = util.parseOrigin(upstream).origin;
 
 	    if (this[kClients].find((pool) => (
 	      pool[kUrl].origin === upstreamOrigin &&
@@ -13579,7 +13920,7 @@ function requireBalancedPool () {
 	    ))) {
 	      return this
 	    }
-	    const pool = this[kFactory](upstreamOrigin, Object.assign({}, this[kOptions]));
+	    const pool = this[kFactory](upstreamOrigin, this[kOptions]);
 
 	    this[kAddClient](pool);
 	    pool.on('connect', () => {
@@ -13619,7 +13960,7 @@ function requireBalancedPool () {
 	  }
 
 	  removeUpstream (upstream) {
-	    const upstreamOrigin = parseOrigin(upstream).origin;
+	    const upstreamOrigin = util.parseOrigin(upstream).origin;
 
 	    const pool = this[kClients].find((pool) => (
 	      pool[kUrl].origin === upstreamOrigin &&
@@ -13635,7 +13976,7 @@ function requireBalancedPool () {
 	  }
 
 	  getUpstream (upstream) {
-	    const upstreamOrigin = parseOrigin(upstream).origin;
+	    const upstreamOrigin = util.parseOrigin(upstream).origin;
 
 	    return this[kClients].find((pool) => (
 	      pool[kUrl].origin === upstreamOrigin &&
@@ -13786,7 +14127,7 @@ function requireRoundRobinPool () {
 
 	    this[kConnections] = connections || null;
 	    this[kUrl] = util.parseOrigin(origin);
-	    this[kOptions] = { ...util.deepClone(options), connect, allowH2, clientTtl };
+	    this[kOptions] = { ...util.deepClone(options), connect, allowH2, clientTtl, socketPath };
 	    this[kOptions].interceptors = options.interceptors
 	      ? { ...options.interceptors }
 	      : undefined;
@@ -13898,7 +14239,7 @@ function requireAgent () {
 	      throw new InvalidArgumentError('maxOrigins must be a number greater than 0')
 	    }
 
-	    super();
+	    super(options);
 
 	    if (connect && typeof connect !== 'function') {
 	      connect = { ...connect };
@@ -14022,6 +14363,924 @@ function requireAgent () {
 	return agent;
 }
 
+var socks5Utils;
+var hasRequiredSocks5Utils;
+
+function requireSocks5Utils () {
+	if (hasRequiredSocks5Utils) return socks5Utils;
+	hasRequiredSocks5Utils = 1;
+
+	const { Buffer } = require$$0$4;
+	const net = require$$1$1;
+	const { InvalidArgumentError } = requireErrors();
+
+	/**
+	 * Parse an address and determine its type
+	 * @param {string} address - The address to parse
+	 * @returns {{type: number, buffer: Buffer}} Address type and buffer
+	 */
+	function parseAddress (address) {
+	  // Check if it's an IPv4 address
+	  if (net.isIPv4(address)) {
+	    const parts = address.split('.').map(Number);
+	    return {
+	      type: 0x01, // IPv4
+	      buffer: Buffer.from(parts)
+	    }
+	  }
+
+	  // Check if it's an IPv6 address
+	  if (net.isIPv6(address)) {
+	    return {
+	      type: 0x04, // IPv6
+	      buffer: parseIPv6(address)
+	    }
+	  }
+
+	  // Otherwise, treat as domain name
+	  const domainBuffer = Buffer.from(address, 'utf8');
+	  if (domainBuffer.length > 255) {
+	    throw new InvalidArgumentError('Domain name too long (max 255 bytes)')
+	  }
+
+	  return {
+	    type: 0x03, // Domain
+	    buffer: Buffer.concat([Buffer.from([domainBuffer.length]), domainBuffer])
+	  }
+	}
+
+	/**
+	 * Parse IPv6 address to buffer
+	 * @param {string} address - IPv6 address string
+	 * @returns {Buffer} 16-byte buffer
+	 */
+	function parseIPv6 (address) {
+	  const buffer = Buffer.alloc(16);
+	  let normalizedAddress = address;
+
+	  // Expand an embedded IPv4 tail into the last two IPv6 groups.
+	  if (address.includes('.')) {
+	    const lastColonIndex = address.lastIndexOf(':');
+	    const ipv4Part = address.slice(lastColonIndex + 1);
+
+	    if (net.isIPv4(ipv4Part)) {
+	      const octets = ipv4Part.split('.').map(Number);
+	      const high = ((octets[0] << 8) | octets[1]).toString(16);
+	      const low = ((octets[2] << 8) | octets[3]).toString(16);
+	      normalizedAddress = `${address.slice(0, lastColonIndex)}:${high}:${low}`;
+	    }
+	  }
+
+	  // Handle compressed notation (::)
+	  const doubleColonIndex = normalizedAddress.indexOf('::');
+	  if (doubleColonIndex !== -1) {
+	    const before = normalizedAddress.slice(0, doubleColonIndex);
+	    const after = normalizedAddress.slice(doubleColonIndex + 2);
+	    const beforeParts = before === '' ? [] : before.split(':');
+	    const afterParts = after === '' ? [] : after.split(':');
+
+	    let bufferIndex = 0;
+	    for (const part of beforeParts) {
+	      buffer.writeUInt16BE(parseInt(part, 16), bufferIndex);
+	      bufferIndex += 2;
+	    }
+	    bufferIndex = 16 - afterParts.length * 2;
+	    for (const part of afterParts) {
+	      buffer.writeUInt16BE(parseInt(part, 16), bufferIndex);
+	      bufferIndex += 2;
+	    }
+	  } else {
+	    const parts = normalizedAddress.split(':');
+	    for (let i = 0; i < parts.length; i++) {
+	      buffer.writeUInt16BE(parseInt(parts[i], 16), i * 2);
+	    }
+	  }
+
+	  return buffer
+	}
+
+	/**
+	 * Build a SOCKS5 address buffer
+	 * @param {number} type - Address type (1=IPv4, 3=Domain, 4=IPv6)
+	 * @param {Buffer} addressBuffer - The address data
+	 * @param {number} port - Port number
+	 * @returns {Buffer} Complete address buffer including type, address, and port
+	 */
+	function buildAddressBuffer (type, addressBuffer, port) {
+	  const portBuffer = Buffer.allocUnsafe(2);
+	  portBuffer.writeUInt16BE(port, 0);
+
+	  return Buffer.concat([
+	    Buffer.from([type]),
+	    addressBuffer,
+	    portBuffer
+	  ])
+	}
+
+	/**
+	 * Parse address from SOCKS5 response
+	 * @param {Buffer} buffer - Buffer containing the address
+	 * @param {number} offset - Starting offset in buffer
+	 * @returns {{address: string, port: number, bytesRead: number}}
+	 */
+	function parseResponseAddress (buffer, offset = 0) {
+	  if (buffer.length < offset + 1) {
+	    throw new InvalidArgumentError('Buffer too small to contain address type')
+	  }
+
+	  const addressType = buffer[offset];
+	  let address;
+	  let currentOffset = offset + 1;
+
+	  switch (addressType) {
+	    case 0x01: { // IPv4
+	      if (buffer.length < currentOffset + 6) {
+	        throw new InvalidArgumentError('Buffer too small for IPv4 address')
+	      }
+	      address = Array.from(buffer.subarray(currentOffset, currentOffset + 4)).join('.');
+	      currentOffset += 4;
+	      break
+	    }
+
+	    case 0x03: { // Domain
+	      if (buffer.length < currentOffset + 1) {
+	        throw new InvalidArgumentError('Buffer too small for domain length')
+	      }
+	      const domainLength = buffer[currentOffset];
+	      currentOffset += 1;
+
+	      if (buffer.length < currentOffset + domainLength + 2) {
+	        throw new InvalidArgumentError('Buffer too small for domain address')
+	      }
+	      address = buffer.subarray(currentOffset, currentOffset + domainLength).toString('utf8');
+	      currentOffset += domainLength;
+	      break
+	    }
+
+	    case 0x04: { // IPv6
+	      if (buffer.length < currentOffset + 18) {
+	        throw new InvalidArgumentError('Buffer too small for IPv6 address')
+	      }
+	      // Convert buffer to IPv6 string
+	      const parts = [];
+	      for (let i = 0; i < 8; i++) {
+	        const value = buffer.readUInt16BE(currentOffset + i * 2);
+	        parts.push(value.toString(16));
+	      }
+	      address = parts.join(':');
+	      currentOffset += 16;
+	      break
+	    }
+
+	    default:
+	      throw new InvalidArgumentError(`Invalid address type: ${addressType}`)
+	  }
+
+	  // Parse port
+	  if (buffer.length < currentOffset + 2) {
+	    throw new InvalidArgumentError('Buffer too small for port')
+	  }
+	  const port = buffer.readUInt16BE(currentOffset);
+	  currentOffset += 2;
+
+	  return {
+	    address,
+	    port,
+	    bytesRead: currentOffset - offset
+	  }
+	}
+
+	/**
+	 * Create error for SOCKS5 reply code
+	 * @param {number} replyCode - SOCKS5 reply code
+	 * @returns {Error} Appropriate error object
+	 */
+	function createReplyError (replyCode) {
+	  const messages = {
+	    0x01: 'General SOCKS server failure',
+	    0x02: 'Connection not allowed by ruleset',
+	    0x03: 'Network unreachable',
+	    0x04: 'Host unreachable',
+	    0x05: 'Connection refused',
+	    0x06: 'TTL expired',
+	    0x07: 'Command not supported',
+	    0x08: 'Address type not supported'
+	  };
+
+	  const message = messages[replyCode] || `Unknown SOCKS5 error code: ${replyCode}`;
+	  const error = new Error(message);
+	  error.code = `SOCKS5_${replyCode}`;
+	  return error
+	}
+
+	socks5Utils = {
+	  parseAddress,
+	  parseIPv6,
+	  buildAddressBuffer,
+	  parseResponseAddress,
+	  createReplyError
+	};
+	return socks5Utils;
+}
+
+var socks5Client;
+var hasRequiredSocks5Client;
+
+function requireSocks5Client () {
+	if (hasRequiredSocks5Client) return socks5Client;
+	hasRequiredSocks5Client = 1;
+
+	const { EventEmitter } = require$$0;
+	const { Buffer } = require$$0$4;
+	const { InvalidArgumentError, Socks5ProxyError } = requireErrors();
+	const { debuglog } = require$$3;
+	const { parseAddress } = requireSocks5Utils();
+
+	const debug = debuglog('undici:socks5');
+	const EMPTY_BUFFER = Buffer.alloc(0);
+
+	// SOCKS5 constants
+	const SOCKS_VERSION = 0x05;
+
+	// Authentication methods
+	const AUTH_METHODS = {
+	  NO_AUTH: 0x00,
+	  GSSAPI: 0x01,
+	  USERNAME_PASSWORD: 0x02,
+	  NO_ACCEPTABLE: 0xFF
+	};
+
+	// SOCKS5 commands
+	const COMMANDS = {
+	  CONNECT: 0x01,
+	  BIND: 0x02,
+	  UDP_ASSOCIATE: 0x03
+	};
+
+	// Address types
+	const ADDRESS_TYPES = {
+	  IPV4: 0x01,
+	  DOMAIN: 0x03,
+	  IPV6: 0x04
+	};
+
+	// Reply codes
+	const REPLY_CODES = {
+	  SUCCEEDED: 0x00,
+	  GENERAL_FAILURE: 0x01,
+	  CONNECTION_NOT_ALLOWED: 0x02,
+	  NETWORK_UNREACHABLE: 0x03,
+	  HOST_UNREACHABLE: 0x04,
+	  CONNECTION_REFUSED: 0x05,
+	  TTL_EXPIRED: 0x06,
+	  COMMAND_NOT_SUPPORTED: 0x07,
+	  ADDRESS_TYPE_NOT_SUPPORTED: 0x08
+	};
+
+	// State machine states
+	const STATES = {
+	  INITIAL: 'initial',
+	  HANDSHAKING: 'handshaking',
+	  AUTHENTICATING: 'authenticating',
+	  AUTHENTICATED: 'authenticated',
+	  CONNECTING: 'connecting',
+	  CONNECTED: 'connected',
+	  ERROR: 'error',
+	  CLOSED: 'closed'
+	};
+
+	/**
+	 * SOCKS5 client implementation
+	 * Handles SOCKS5 protocol negotiation and connection establishment
+	 */
+	class Socks5Client extends EventEmitter {
+	  constructor (socket, options = {}) {
+	    super();
+
+	    if (!socket) {
+	      throw new InvalidArgumentError('socket is required')
+	    }
+
+	    this.socket = socket;
+	    this.options = options;
+	    this.state = STATES.INITIAL;
+	    this.buffer = EMPTY_BUFFER;
+	    this.onSocketData = this.onData.bind(this);
+	    this.onSocketError = this.onError.bind(this);
+	    this.onSocketClose = this.onClose.bind(this);
+
+	    // Authentication settings
+	    this.authMethods = [];
+	    if (options.username && options.password) {
+	      this.authMethods.push(AUTH_METHODS.USERNAME_PASSWORD);
+	    }
+	    this.authMethods.push(AUTH_METHODS.NO_AUTH);
+
+	    // Socket event handlers
+	    this.socket.on('data', this.onSocketData);
+	    this.socket.on('error', this.onSocketError);
+	    this.socket.on('close', this.onSocketClose);
+	  }
+
+	  /**
+	   * Handle incoming data from the socket
+	   */
+	  onData (data) {
+	    debug('received data', data.length, 'bytes in state', this.state);
+	    this.buffer = Buffer.concat([this.buffer, data]);
+
+	    try {
+	      switch (this.state) {
+	        case STATES.HANDSHAKING:
+	          this.handleHandshakeResponse();
+	          break
+	        case STATES.AUTHENTICATING:
+	          this.handleAuthResponse();
+	          break
+	        case STATES.CONNECTING:
+	          this.handleConnectResponse();
+	          break
+	      }
+	    } catch (err) {
+	      this.onError(err);
+	    }
+	  }
+
+	  /**
+	   * Handle socket errors
+	   */
+	  onError (err) {
+	    debug('socket error', err);
+	    this.state = STATES.ERROR;
+	    this.emit('error', err);
+	    this.destroy();
+	  }
+
+	  /**
+	   * Handle socket close
+	   */
+	  onClose () {
+	    debug('socket closed');
+	    this.state = STATES.CLOSED;
+	    this.emit('close');
+	  }
+
+	  /**
+	   * Destroy the client and underlying socket
+	   */
+	  destroy () {
+	    if (this.socket && !this.socket.destroyed) {
+	      this.socket.destroy();
+	    }
+	  }
+
+	  markAuthenticated () {
+	    this.state = STATES.AUTHENTICATED;
+	    this.emit('authenticated');
+	  }
+
+	  /**
+	   * Start the SOCKS5 handshake
+	   */
+	  handshake () {
+	    if (this.state !== STATES.INITIAL) {
+	      throw new InvalidArgumentError('Handshake already started')
+	    }
+
+	    debug('starting handshake with', this.authMethods.length, 'auth methods');
+	    this.state = STATES.HANDSHAKING;
+
+	    // Build handshake request
+	    // +----+----------+----------+
+	    // |VER | NMETHODS | METHODS  |
+	    // +----+----------+----------+
+	    // | 1  |    1     | 1 to 255 |
+	    // +----+----------+----------+
+	    const request = Buffer.alloc(2 + this.authMethods.length);
+	    request[0] = SOCKS_VERSION;
+	    request[1] = this.authMethods.length;
+	    this.authMethods.forEach((method, i) => {
+	      request[2 + i] = method;
+	    });
+
+	    this.socket.write(request);
+	  }
+
+	  /**
+	   * Handle handshake response from server
+	   */
+	  handleHandshakeResponse () {
+	    if (this.buffer.length < 2) {
+	      return // Not enough data yet
+	    }
+
+	    const version = this.buffer[0];
+	    const method = this.buffer[1];
+
+	    if (version !== SOCKS_VERSION) {
+	      throw new Socks5ProxyError(`Invalid SOCKS version: ${version}`, 'UND_ERR_SOCKS5_VERSION')
+	    }
+
+	    if (method === AUTH_METHODS.NO_ACCEPTABLE) {
+	      throw new Socks5ProxyError('No acceptable authentication method', 'UND_ERR_SOCKS5_AUTH_REJECTED')
+	    }
+
+	    this.buffer = this.buffer.subarray(2);
+	    debug('server selected auth method', method);
+
+	    if (method === AUTH_METHODS.NO_AUTH) {
+	      this.markAuthenticated();
+	    } else if (method === AUTH_METHODS.USERNAME_PASSWORD) {
+	      this.state = STATES.AUTHENTICATING;
+	      this.sendAuthRequest();
+	    } else {
+	      throw new Socks5ProxyError(`Unsupported authentication method: ${method}`, 'UND_ERR_SOCKS5_AUTH_METHOD')
+	    }
+	  }
+
+	  /**
+	   * Send username/password authentication request
+	   */
+	  sendAuthRequest () {
+	    const { username, password } = this.options;
+
+	    if (!username || !password) {
+	      throw new InvalidArgumentError('Username and password required for authentication')
+	    }
+
+	    debug('sending username/password auth');
+
+	    // Username/Password authentication request (RFC 1929)
+	    // +----+------+----------+------+----------+
+	    // |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+	    // +----+------+----------+------+----------+
+	    // | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+	    // +----+------+----------+------+----------+
+	    const usernameBuffer = Buffer.from(username);
+	    const passwordBuffer = Buffer.from(password);
+
+	    if (usernameBuffer.length > 255 || passwordBuffer.length > 255) {
+	      throw new InvalidArgumentError('Username or password too long')
+	    }
+
+	    const request = Buffer.alloc(3 + usernameBuffer.length + passwordBuffer.length);
+	    request[0] = 0x01; // Sub-negotiation version
+	    request[1] = usernameBuffer.length;
+	    usernameBuffer.copy(request, 2);
+	    request[2 + usernameBuffer.length] = passwordBuffer.length;
+	    passwordBuffer.copy(request, 3 + usernameBuffer.length);
+
+	    this.socket.write(request);
+	  }
+
+	  /**
+	   * Handle authentication response
+	   */
+	  handleAuthResponse () {
+	    if (this.buffer.length < 2) {
+	      return // Not enough data yet
+	    }
+
+	    const version = this.buffer[0];
+	    const status = this.buffer[1];
+
+	    if (version !== 0x01) {
+	      throw new Socks5ProxyError(`Invalid auth sub-negotiation version: ${version}`, 'UND_ERR_SOCKS5_AUTH_VERSION')
+	    }
+
+	    if (status !== 0x00) {
+	      throw new Socks5ProxyError('Authentication failed', 'UND_ERR_SOCKS5_AUTH_FAILED')
+	    }
+
+	    this.buffer = this.buffer.subarray(2);
+	    debug('authentication successful');
+	    this.markAuthenticated();
+	  }
+
+	  /**
+	   * Send CONNECT command
+	   * @param {string} address - Target address (IP or domain)
+	   * @param {number} port - Target port
+	   */
+	  connect (address, port) {
+	    if (this.state === STATES.CONNECTING || this.state === STATES.CONNECTED) {
+	      throw new InvalidArgumentError('Connection already in progress')
+	    }
+
+	    if (this.state !== STATES.AUTHENTICATED) {
+	      throw new InvalidArgumentError('Client must be authenticated before CONNECT')
+	    }
+
+	    debug('connecting to', address, port);
+	    this.state = STATES.CONNECTING;
+
+	    const request = this.buildConnectRequest(COMMANDS.CONNECT, address, port);
+	    this.socket.write(request);
+	  }
+
+	  /**
+	   * Build a SOCKS5 request
+	   */
+	  buildConnectRequest (command, address, port) {
+	    // Parse address to determine type and buffer
+	    const { type: addressType, buffer: addressBuffer } = parseAddress(address);
+
+	    // Build request
+	    // +----+-----+-------+------+----------+----------+
+	    // |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+	    // +----+-----+-------+------+----------+----------+
+	    // | 1  |  1  | X'00' |  1   | Variable |    2     |
+	    // +----+-----+-------+------+----------+----------+
+	    const request = Buffer.alloc(4 + addressBuffer.length + 2);
+	    request[0] = SOCKS_VERSION;
+	    request[1] = command;
+	    request[2] = 0x00; // Reserved
+	    request[3] = addressType;
+	    addressBuffer.copy(request, 4);
+	    request.writeUInt16BE(port, 4 + addressBuffer.length);
+
+	    return request
+	  }
+
+	  /**
+	   * Handle CONNECT response
+	   */
+	  handleConnectResponse () {
+	    if (this.buffer.length < 4) {
+	      return // Not enough data for header
+	    }
+
+	    const version = this.buffer[0];
+	    const reply = this.buffer[1];
+	    const addressType = this.buffer[3];
+
+	    if (version !== SOCKS_VERSION) {
+	      throw new Socks5ProxyError(`Invalid SOCKS version in reply: ${version}`, 'UND_ERR_SOCKS5_REPLY_VERSION')
+	    }
+
+	    // Calculate the expected response length
+	    let responseLength = 4; // VER + REP + RSV + ATYP
+	    if (addressType === ADDRESS_TYPES.IPV4) {
+	      responseLength += 4 + 2; // IPv4 + port
+	    } else if (addressType === ADDRESS_TYPES.DOMAIN) {
+	      if (this.buffer.length < 5) {
+	        return // Need domain length byte
+	      }
+	      responseLength += 1 + this.buffer[4] + 2; // length byte + domain + port
+	    } else if (addressType === ADDRESS_TYPES.IPV6) {
+	      responseLength += 16 + 2; // IPv6 + port
+	    } else {
+	      throw new Socks5ProxyError(`Invalid address type in reply: ${addressType}`, 'UND_ERR_SOCKS5_ADDR_TYPE')
+	    }
+
+	    if (this.buffer.length < responseLength) {
+	      return // Not enough data for full response
+	    }
+
+	    if (reply !== REPLY_CODES.SUCCEEDED) {
+	      const errorMessage = this.getReplyErrorMessage(reply);
+	      throw new Socks5ProxyError(`SOCKS5 connection failed: ${errorMessage}`, `UND_ERR_SOCKS5_REPLY_${reply}`)
+	    }
+
+	    // Parse bound address and port
+	    let boundAddress;
+	    let offset = 4;
+
+	    if (addressType === ADDRESS_TYPES.IPV4) {
+	      boundAddress = Array.from(this.buffer.subarray(offset, offset + 4)).join('.');
+	      offset += 4;
+	    } else if (addressType === ADDRESS_TYPES.DOMAIN) {
+	      const domainLength = this.buffer[offset];
+	      offset += 1;
+	      boundAddress = this.buffer.subarray(offset, offset + domainLength).toString();
+	      offset += domainLength;
+	    } else if (addressType === ADDRESS_TYPES.IPV6) {
+	      // Parse IPv6 address from 16-byte buffer
+	      const parts = [];
+	      for (let i = 0; i < 8; i++) {
+	        const value = this.buffer.readUInt16BE(offset + i * 2);
+	        parts.push(value.toString(16));
+	      }
+	      boundAddress = parts.join(':');
+	      offset += 16;
+	    }
+
+	    const boundPort = this.buffer.readUInt16BE(offset);
+
+	    this.buffer = EMPTY_BUFFER;
+	    this.state = STATES.CONNECTED;
+	    this.socket.removeListener('data', this.onSocketData);
+
+	    debug('connected, bound address:', boundAddress, 'port:', boundPort);
+	    this.emit('connected', { address: boundAddress, port: boundPort });
+	  }
+
+	  /**
+	   * Get human-readable error message for reply code
+	   */
+	  getReplyErrorMessage (reply) {
+	    switch (reply) {
+	      case REPLY_CODES.GENERAL_FAILURE:
+	        return 'General SOCKS server failure'
+	      case REPLY_CODES.CONNECTION_NOT_ALLOWED:
+	        return 'Connection not allowed by ruleset'
+	      case REPLY_CODES.NETWORK_UNREACHABLE:
+	        return 'Network unreachable'
+	      case REPLY_CODES.HOST_UNREACHABLE:
+	        return 'Host unreachable'
+	      case REPLY_CODES.CONNECTION_REFUSED:
+	        return 'Connection refused'
+	      case REPLY_CODES.TTL_EXPIRED:
+	        return 'TTL expired'
+	      case REPLY_CODES.COMMAND_NOT_SUPPORTED:
+	        return 'Command not supported'
+	      case REPLY_CODES.ADDRESS_TYPE_NOT_SUPPORTED:
+	        return 'Address type not supported'
+	      default:
+	        return `Unknown error code: ${reply}`
+	    }
+	  }
+	}
+
+	socks5Client = {
+	  Socks5Client,
+	  AUTH_METHODS,
+	  COMMANDS,
+	  ADDRESS_TYPES,
+	  REPLY_CODES,
+	  STATES
+	};
+	return socks5Client;
+}
+
+var socks5ProxyAgent;
+var hasRequiredSocks5ProxyAgent;
+
+function requireSocks5ProxyAgent () {
+	if (hasRequiredSocks5ProxyAgent) return socks5ProxyAgent;
+	hasRequiredSocks5ProxyAgent = 1;
+
+	const { URL } = require$$0$5;
+
+	let tls; // include tls conditionally since it is not always available
+	const DispatcherBase = requireDispatcherBase();
+	const { InvalidArgumentError } = requireErrors();
+	const { Socks5Client, STATES } = requireSocks5Client();
+	const { kDispatch, kClose, kDestroy } = requireSymbols();
+	const Pool = requirePool();
+	const buildConnector = requireConnect();
+	const { debuglog } = require$$3;
+
+	const debug = debuglog('undici:socks5-proxy');
+
+	const kProxyUrl = Symbol('proxy url');
+	const kProxyHeaders = Symbol('proxy headers');
+	const kProxyAuth = Symbol('proxy auth');
+	const kProxyProtocol = Symbol('proxy protocol');
+	const kPools = Symbol('pools');
+	const kConnector = Symbol('connector');
+	const kRequestTls = Symbol('request tls settings');
+
+	// Static flag to ensure warning is only emitted once per process
+	let experimentalWarningEmitted = false;
+
+	/**
+	 * SOCKS5 proxy agent for dispatching requests through a SOCKS5 proxy
+	 */
+	class Socks5ProxyAgent extends DispatcherBase {
+	  constructor (proxyUrl, options = {}) {
+	    super();
+
+	    // Emit experimental warning only once
+	    if (!experimentalWarningEmitted) {
+	      process.emitWarning(
+	        'SOCKS5 proxy support is experimental and subject to change',
+	        'ExperimentalWarning'
+	      );
+	      experimentalWarningEmitted = true;
+	    }
+
+	    if (!proxyUrl) {
+	      throw new InvalidArgumentError('Proxy URL is mandatory')
+	    }
+
+	    // Parse proxy URL
+	    const url = typeof proxyUrl === 'string' ? new URL(proxyUrl) : proxyUrl;
+
+	    if (url.protocol !== 'socks5:' && url.protocol !== 'socks:') {
+	      throw new InvalidArgumentError('Proxy URL must use socks5:// or socks:// protocol')
+	    }
+
+	    this[kProxyUrl] = url;
+	    this[kProxyHeaders] = options.headers || {};
+	    this[kProxyProtocol] = options.proxyTls ? 'https:' : 'http:';
+	    this[kRequestTls] = options.requestTls;
+
+	    // Extract auth from URL or options
+	    this[kProxyAuth] = {
+	      username: options.username || (url.username ? decodeURIComponent(url.username) : null),
+	      password: options.password || (url.password ? decodeURIComponent(url.password) : null)
+	    };
+
+	    // Create connector for proxy connection
+	    this[kConnector] = options.connect || buildConnector({
+	      ...options.proxyTls,
+	      servername: options.proxyTls?.servername || url.hostname
+	    });
+
+	    // Pools for the actual HTTP connections (with SOCKS5 tunnel connect function), keyed by origin
+	    this[kPools] = new Map();
+	  }
+
+	  /**
+	   * Create a SOCKS5 connection to the proxy
+	   */
+	  async createSocks5Connection (targetHost, targetPort) {
+	    const proxyHost = this[kProxyUrl].hostname;
+	    const proxyPort = parseInt(this[kProxyUrl].port) || 1080;
+
+	    debug('creating SOCKS5 connection to', proxyHost, proxyPort);
+
+	    // Connect to the SOCKS5 proxy
+	    const socket = await new Promise((resolve, reject) => {
+	      this[kConnector]({
+	        hostname: proxyHost,
+	        host: proxyHost,
+	        port: proxyPort,
+	        protocol: this[kProxyProtocol]
+	      }, (err, socket) => {
+	        if (err) {
+	          reject(err);
+	        } else {
+	          resolve(socket);
+	        }
+	      });
+	    });
+
+	    // Create SOCKS5 client
+	    const socks5Client = new Socks5Client(socket, this[kProxyAuth]);
+
+	    // Handle SOCKS5 errors
+	    socks5Client.on('error', (err) => {
+	      debug('SOCKS5 error:', err);
+	      socket.destroy();
+	    });
+
+	    // Perform SOCKS5 handshake
+	    await socks5Client.handshake();
+
+	    // Wait for authentication (if required)
+	    await new Promise((resolve, reject) => {
+	      const timeout = setTimeout(() => {
+	        reject(new Error('SOCKS5 authentication timeout'));
+	      }, 5000);
+
+	      const onAuthenticated = () => {
+	        clearTimeout(timeout);
+	        socks5Client.removeListener('error', onError);
+	        resolve();
+	      };
+
+	      const onError = (err) => {
+	        clearTimeout(timeout);
+	        socks5Client.removeListener('authenticated', onAuthenticated);
+	        reject(err);
+	      };
+
+	      // Check if already authenticated (for NO_AUTH method)
+	      if (socks5Client.state === STATES.AUTHENTICATED) {
+	        clearTimeout(timeout);
+	        resolve();
+	      } else {
+	        socks5Client.once('authenticated', onAuthenticated);
+	        socks5Client.once('error', onError);
+	      }
+	    });
+
+	    // Send CONNECT command
+	    await socks5Client.connect(targetHost, targetPort);
+
+	    // Wait for connection
+	    await new Promise((resolve, reject) => {
+	      const timeout = setTimeout(() => {
+	        reject(new Error('SOCKS5 connection timeout'));
+	      }, 5000);
+
+	      const onConnected = (info) => {
+	        debug('SOCKS5 tunnel established to', targetHost, targetPort, 'via', info);
+	        clearTimeout(timeout);
+	        socks5Client.removeListener('error', onError);
+	        resolve();
+	      };
+
+	      const onError = (err) => {
+	        clearTimeout(timeout);
+	        socks5Client.removeListener('connected', onConnected);
+	        reject(err);
+	      };
+
+	      socks5Client.once('connected', onConnected);
+	      socks5Client.once('error', onError);
+	    });
+
+	    return socket
+	  }
+
+	  /**
+	   * Dispatch a request through the SOCKS5 proxy
+	   */
+	  [kDispatch] (opts, handler) {
+	    const { origin } = opts;
+
+	    debug('dispatching request to', origin, 'via SOCKS5');
+
+	    try {
+	      const originKey = String(origin);
+	      let pool = this[kPools].get(originKey);
+	      // Create a Pool per origin so requests are not routed to the wrong host
+	      if (!pool || pool.destroyed || pool.closed) {
+	        pool = new Pool(origin, {
+	          pipelining: opts.pipelining,
+	          connections: opts.connections,
+	          connect: async (connectOpts, callback) => {
+	            try {
+	              const url = new URL(origin);
+	              const targetHost = url.hostname;
+	              const targetPort = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
+
+	              debug('establishing SOCKS5 connection to', targetHost, targetPort);
+
+	              // Create SOCKS5 tunnel
+	              const socket = await this.createSocks5Connection(targetHost, targetPort);
+
+	              // Handle TLS if needed
+	              let finalSocket = socket;
+	              if (url.protocol === 'https:') {
+	                if (!tls) {
+	                  tls = require('node:tls');
+	                }
+	                debug('upgrading to TLS');
+	                finalSocket = tls.connect({
+	                  ...this[kRequestTls],
+	                  socket,
+	                  servername: this[kRequestTls]?.servername || targetHost
+	                });
+
+	                await new Promise((resolve, reject) => {
+	                  finalSocket.once('secureConnect', resolve);
+	                  finalSocket.once('error', reject);
+	                });
+	              }
+
+	              callback(null, finalSocket);
+	            } catch (err) {
+	              debug('SOCKS5 connection error:', err);
+	              callback(err);
+	            }
+	          }
+	        });
+	        this[kPools].set(originKey, pool);
+	      }
+
+	      // Dispatch the request through the per-origin pool
+	      return pool[kDispatch](opts, handler)
+	    } catch (err) {
+	      debug('dispatch error:', err);
+	      if (typeof handler.onResponseError === 'function') {
+	        handler.onResponseError(null, err);
+	        return false
+	      } else if (typeof handler.onError === 'function') {
+	        handler.onError(err);
+	        return false
+	      } else {
+	        throw err
+	      }
+	    }
+	  }
+
+	  async [kClose] () {
+	    const closePromises = [];
+	    for (const pool of this[kPools].values()) {
+	      closePromises.push(pool.close());
+	    }
+	    this[kPools].clear();
+	    await Promise.all(closePromises);
+	  }
+
+	  async [kDestroy] (err) {
+	    const destroyPromises = [];
+	    for (const pool of this[kPools].values()) {
+	      destroyPromises.push(pool.destroy(err));
+	    }
+	    this[kPools].clear();
+	    await Promise.all(destroyPromises);
+	  }
+	}
+
+	socks5ProxyAgent = Socks5ProxyAgent;
+	return socks5ProxyAgent;
+}
+
 var proxyAgent;
 var hasRequiredProxyAgent;
 
@@ -14037,6 +15296,7 @@ function requireProxyAgent () {
 	const buildConnector = requireConnect();
 	const Client = requireClient();
 	const { channels } = requireDiagnostics();
+	const Socks5ProxyAgent = requireSocks5ProxyAgent();
 
 	const kAgent = Symbol('proxy agent');
 	const kClient = Symbol('proxy client');
@@ -14161,6 +15421,20 @@ function requireProxyAgent () {
 	    const agentFactory = opts.factory || defaultAgentFactory;
 	    const factory = (origin, options) => {
 	      const { protocol } = new URL(origin);
+
+	      // Handle SOCKS5 proxy
+	      if (this[kProxy].protocol === 'socks5:' || this[kProxy].protocol === 'socks:') {
+	        return new Socks5ProxyAgent(this[kProxy].uri, {
+	          headers: this[kProxyHeaders],
+	          connect,
+	          factory: agentFactory,
+	          username: opts.username || username,
+	          password: opts.password || password,
+	          proxyTls: opts.proxyTls,
+	          requestTls: opts.requestTls
+	        })
+	      }
+
 	      if (!this[kTunnelProxy] && protocol === 'http:' && this[kProxy].protocol === 'http:') {
 	        return new Http1ProxyWrapper(this[kProxy].uri, {
 	          headers: this[kProxyHeaders],
@@ -14170,11 +15444,26 @@ function requireProxyAgent () {
 	      }
 	      return agentFactory(origin, options)
 	    };
-	    this[kClient] = clientFactory(url, { connect });
+
+	    // For SOCKS5 proxies, we don't need a client to the proxy itself
+	    // The SOCKS5 connection is handled within Socks5ProxyAgent
+	    if (protocol === 'socks5:' || protocol === 'socks:') {
+	      this[kClient] = null;
+	    } else {
+	      this[kClient] = clientFactory(url, { connect });
+	    }
+
 	    this[kAgent] = new Agent({
 	      ...opts,
 	      factory,
 	      connect: async (opts, callback) => {
+	        // SOCKS5 proxies handle their own connections via Socks5ProxyAgent,
+	        // so this connect function should never be called for them.
+	        if (!this[kClient]) {
+	          callback(new InvalidArgumentError('Cannot establish tunnel connection without a proxy client'));
+	          return
+	        }
+
 	        let requestedPath = opts.host;
 	        if (!opts.port) {
 	          requestedPath += `:${defaultProtocolPort(opts.protocol)}`;
@@ -14262,17 +15551,19 @@ function requireProxyAgent () {
 	  }
 
 	  [kClose] () {
-	    return Promise.all([
-	      this[kAgent].close(),
-	      this[kClient].close()
-	    ])
+	    const promises = [this[kAgent].close()];
+	    if (this[kClient]) {
+	      promises.push(this[kClient].close());
+	    }
+	    return Promise.all(promises)
 	  }
 
 	  [kDestroy] () {
-	    return Promise.all([
-	      this[kAgent].destroy(),
-	      this[kClient].destroy()
-	    ])
+	    const promises = [this[kAgent].destroy()];
+	    if (this[kClient]) {
+	      promises.push(this[kClient].destroy());
+	    }
+	    return Promise.all(promises)
 	  }
 	}
 
@@ -14477,7 +15768,7 @@ var hasRequiredRetryHandler;
 function requireRetryHandler () {
 	if (hasRequiredRetryHandler) return retryHandler;
 	hasRequiredRetryHandler = 1;
-	const assert = require$$0;
+	const assert = require$$0$1;
 
 	const { kRetryHandlerDefaultRetry } = requireSymbols();
 	const { RequestRetryError } = requireErrors();
@@ -14491,6 +15782,26 @@ function requireRetryHandler () {
 	function calculateRetryAfterHeader (retryAfter) {
 	  const retryTime = new Date(retryAfter).getTime();
 	  return isNaN(retryTime) ? 0 : retryTime - Date.now()
+	}
+
+	function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+	  const contentLength = headers['content-length'];
+	  if (contentLength == null) {
+	    return
+	  }
+
+	  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+	    return
+	  }
+
+	  const length = Number(contentLength);
+	  const expectedLength = range.end - range.start + 1;
+	  if (!Number.isFinite(length) || length !== expectedLength) {
+	    throw new RequestRetryError('Content-Length mismatch', statusCode, {
+	      headers,
+	      data: { count: retryCount }
+	    })
+	  }
 	}
 
 	class RetryHandler {
@@ -14707,6 +16018,8 @@ function requireRetryHandler () {
 	        })
 	      }
 
+	      validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount);
+
 	      const { start, size, end = size ? size - 1 : null } = contentRange;
 
 	      assert(this.start === start, 'content-range mismatch');
@@ -14730,6 +16043,8 @@ function requireRetryHandler () {
 	          );
 	          return
 	        }
+
+	        validatePartialResponseContentLength(headers, range, statusCode, this.retryCount);
 
 	        const { start, size, end = size ? size - 1 : null } = range;
 	        assert(
@@ -14938,7 +16253,7 @@ function requireH2cClient () {
 	      )
 	    }
 
-	    const { connect, maxConcurrentStreams, pipelining, ...opts } =
+	    const { maxConcurrentStreams, pipelining, ...opts } =
 	            clientOpts ?? {};
 	    let defaultMaxConcurrentStreams = 100;
 	    let defaultPipelining = 100;
@@ -14986,8 +16301,8 @@ function requireReadable () {
 	if (hasRequiredReadable) return readable;
 	hasRequiredReadable = 1;
 
-	const assert = require$$0;
-	const { Readable } = require$$0$1;
+	const assert = require$$0$1;
+	const { Readable } = require$$0$2;
 	const { RequestAbortedError, NotSupportedError, InvalidArgumentError, AbortError } = requireErrors();
 	const util = requireUtil$5();
 	const { ReadableStreamFrom } = requireUtil$5();
@@ -15573,8 +16888,8 @@ function requireApiRequest () {
 	if (hasRequiredApiRequest) return apiRequest.exports;
 	hasRequiredApiRequest = 1;
 
-	const assert = require$$0;
-	const { AsyncResource } = require$$1$2;
+	const assert = require$$0$1;
+	const { AsyncResource } = require$$1$3;
 	const { Readable } = requireReadable();
 	const { InvalidArgumentError, RequestAbortedError } = requireErrors();
 	const util = requireUtil$5();
@@ -15594,7 +16909,7 @@ function requireApiRequest () {
 	        throw new InvalidArgumentError('invalid callback')
 	      }
 
-	      if (highWaterMark && (typeof highWaterMark !== 'number' || highWaterMark < 0)) {
+	      if (highWaterMark != null && (!Number.isFinite(highWaterMark) || highWaterMark < 0)) {
 	        throw new InvalidArgumentError('invalid highWaterMark')
 	      }
 
@@ -15862,9 +17177,9 @@ function requireApiStream () {
 	if (hasRequiredApiStream) return apiStream;
 	hasRequiredApiStream = 1;
 
-	const assert = require$$0;
-	const { finished } = require$$0$1;
-	const { AsyncResource } = require$$1$2;
+	const assert = require$$0$1;
+	const { finished } = require$$0$2;
+	const { AsyncResource } = require$$1$3;
 	const { InvalidArgumentError, InvalidReturnValueError } = requireErrors();
 	const util = requireUtil$5();
 	const { addSignal, removeSignal } = requireAbortSignal();
@@ -16083,9 +17398,9 @@ function requireApiPipeline () {
 	  Readable,
 	  Duplex,
 	  PassThrough
-	} = require$$0$1;
-	const assert = require$$0;
-	const { AsyncResource } = require$$1$2;
+	} = require$$0$2;
+	const assert = require$$0$1;
+	const { AsyncResource } = require$$1$3;
 	const {
 	  InvalidArgumentError,
 	  InvalidReturnValueError,
@@ -16340,8 +17655,8 @@ function requireApiUpgrade () {
 	hasRequiredApiUpgrade = 1;
 
 	const { InvalidArgumentError, SocketError } = requireErrors();
-	const { AsyncResource } = require$$1$2;
-	const assert = require$$0;
+	const { AsyncResource } = require$$1$3;
+	const assert = require$$0$1;
 	const util = requireUtil$5();
 	const { kHTTP2Stream } = requireSymbols();
 	const { addSignal, removeSignal } = requireAbortSignal();
@@ -16458,8 +17773,8 @@ function requireApiConnect () {
 	if (hasRequiredApiConnect) return apiConnect;
 	hasRequiredApiConnect = 1;
 
-	const assert = require$$0;
-	const { AsyncResource } = require$$1$2;
+	const assert = require$$0$1;
+	const { AsyncResource } = require$$1$3;
 	const { InvalidArgumentError, SocketError } = requireErrors();
 	const util = requireUtil$5();
 	const { addSignal, removeSignal } = requireAbortSignal();
@@ -16654,7 +17969,8 @@ function requireMockSymbols () {
 	  kMockAgentAddCallHistoryLog: Symbol('mock agent add call history log'),
 	  kMockAgentIsCallHistoryEnabled: Symbol('mock agent is call history enabled'),
 	  kMockAgentAcceptsNonStandardSearchParameters: Symbol('mock agent accepts non standard search parameters'),
-	  kMockCallHistoryAddLog: Symbol('mock call history add log')
+	  kMockCallHistoryAddLog: Symbol('mock call history add log'),
+	  kTotalDispatchCount: Symbol('total dispatch count')
 	};
 	return mockSymbols;
 }
@@ -16672,7 +17988,8 @@ function requireMockUtils () {
 	  kMockAgent,
 	  kOriginalDispatch,
 	  kOrigin,
-	  kGetNetConnect
+	  kGetNetConnect,
+	  kTotalDispatchCount
 	} = requireMockSymbols();
 	const { serializePathWithQuery } = requireUtil$5();
 	const { STATUS_CODES } = require$$2;
@@ -16872,6 +18189,8 @@ function requireMockUtils () {
 	  const replyData = typeof data === 'function' ? { callback: data } : { ...data };
 	  const newMockDispatch = { ...baseData, ...key, pending: true, data: { error: null, ...replyData } };
 	  mockDispatches.push(newMockDispatch);
+	  // Track total number of intercepts ever registered for better error messages
+	  mockDispatches[kTotalDispatchCount] = (mockDispatches[kTotalDispatchCount] || 0) + 1;
 	  return newMockDispatch
 	}
 
@@ -17067,13 +18386,16 @@ function requireMockUtils () {
 	      } catch (error) {
 	        if (error.code === 'UND_MOCK_ERR_MOCK_NOT_MATCHED') {
 	          const netConnect = agent[kGetNetConnect]();
+	          const totalInterceptsCount = this[kDispatches][kTotalDispatchCount] || this[kDispatches].length;
+	          const pendingInterceptsCount = this[kDispatches].filter(({ consumed }) => !consumed).length;
+	          const interceptsMessage = `, ${pendingInterceptsCount} interceptor(s) remaining out of ${totalInterceptsCount} defined`;
 	          if (netConnect === false) {
-	            throw new MockNotMatchedError(`${error.message}: subsequent request to origin ${origin} was not allowed (net.connect disabled)`)
+	            throw new MockNotMatchedError(`${error.message}: subsequent request to origin ${origin} was not allowed (net.connect disabled)${interceptsMessage}`)
 	          }
 	          if (checkNetConnect(netConnect, origin)) {
 	            originalDispatch.call(this, opts, handler);
 	          } else {
-	            throw new MockNotMatchedError(`${error.message}: subsequent request to origin ${origin} was not allowed (net.connect is not enabled for this origin)`)
+	            throw new MockNotMatchedError(`${error.message}: subsequent request to origin ${origin} was not allowed (net.connect is not enabled for this origin)${interceptsMessage}`)
 	          }
 	        } else {
 	          throw error
@@ -17452,14 +18774,14 @@ function requireMockCallHistory () {
 	const { kMockCallHistoryAddLog } = requireMockSymbols();
 	const { InvalidArgumentError } = requireErrors();
 
-	function handleFilterCallsWithOptions (criteria, options, handler, store) {
+	function handleFilterCallsWithOptions (criteria, options, handler, store, allLogs) {
 	  switch (options.operator) {
 	    case 'OR':
-	      store.push(...handler(criteria));
+	      store.push(...handler(criteria, allLogs));
 
 	      return store
 	    case 'AND':
-	      return handler.call({ logs: store }, criteria)
+	      return handler(criteria, store)
 	    default:
 	      // guard -- should never happens because buildAndValidateFilterCallsOptions is called before
 	      throw new InvalidArgumentError('options.operator must to be a case insensitive string equal to \'OR\' or \'AND\'')
@@ -17484,14 +18806,14 @@ function requireMockCallHistory () {
 	}
 
 	function makeFilterCalls (parameterName) {
-	  return (parameterValue) => {
+	  return (parameterValue, logs) => {
 	    if (typeof parameterValue === 'string' || parameterValue == null) {
-	      return this.logs.filter((log) => {
+	      return logs.filter((log) => {
 	        return log[parameterName] === parameterValue
 	      })
 	    }
 	    if (parameterValue instanceof RegExp) {
-	      return this.logs.filter((log) => {
+	      return logs.filter((log) => {
 	        return parameterValue.test(log[parameterName])
 	      })
 	    }
@@ -17624,30 +18946,30 @@ function requireMockCallHistory () {
 
 	      const finalOptions = { operator: 'OR', ...buildAndValidateFilterCallsOptions(options) };
 
-	      let maybeDuplicatedLogsFiltered = [];
+	      let maybeDuplicatedLogsFiltered = finalOptions.operator === 'AND' ? this.logs : [];
 	      if ('protocol' in criteria) {
-	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.protocol, finalOptions, this.filterCallsByProtocol, maybeDuplicatedLogsFiltered);
+	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.protocol, finalOptions, this.filterCallsByProtocol, maybeDuplicatedLogsFiltered, this.logs);
 	      }
 	      if ('host' in criteria) {
-	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.host, finalOptions, this.filterCallsByHost, maybeDuplicatedLogsFiltered);
+	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.host, finalOptions, this.filterCallsByHost, maybeDuplicatedLogsFiltered, this.logs);
 	      }
 	      if ('port' in criteria) {
-	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.port, finalOptions, this.filterCallsByPort, maybeDuplicatedLogsFiltered);
+	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.port, finalOptions, this.filterCallsByPort, maybeDuplicatedLogsFiltered, this.logs);
 	      }
 	      if ('origin' in criteria) {
-	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.origin, finalOptions, this.filterCallsByOrigin, maybeDuplicatedLogsFiltered);
+	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.origin, finalOptions, this.filterCallsByOrigin, maybeDuplicatedLogsFiltered, this.logs);
 	      }
 	      if ('path' in criteria) {
-	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.path, finalOptions, this.filterCallsByPath, maybeDuplicatedLogsFiltered);
+	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.path, finalOptions, this.filterCallsByPath, maybeDuplicatedLogsFiltered, this.logs);
 	      }
 	      if ('hash' in criteria) {
-	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.hash, finalOptions, this.filterCallsByHash, maybeDuplicatedLogsFiltered);
+	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.hash, finalOptions, this.filterCallsByHash, maybeDuplicatedLogsFiltered, this.logs);
 	      }
 	      if ('fullUrl' in criteria) {
-	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.fullUrl, finalOptions, this.filterCallsByFullUrl, maybeDuplicatedLogsFiltered);
+	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.fullUrl, finalOptions, this.filterCallsByFullUrl, maybeDuplicatedLogsFiltered, this.logs);
 	      }
 	      if ('method' in criteria) {
-	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.method, finalOptions, this.filterCallsByMethod, maybeDuplicatedLogsFiltered);
+	        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.method, finalOptions, this.filterCallsByMethod, maybeDuplicatedLogsFiltered, this.logs);
 	      }
 
 	      const uniqLogsFiltered = [...new Set(maybeDuplicatedLogsFiltered)];
@@ -17781,8 +19103,8 @@ function requirePendingInterceptorsFormatter () {
 	if (hasRequiredPendingInterceptorsFormatter) return pendingInterceptorsFormatter;
 	hasRequiredPendingInterceptorsFormatter = 1;
 
-	const { Transform } = require$$0$1;
-	const { Console } = require$$1$3;
+	const { Transform } = require$$0$2;
+	const { Console } = require$$1$4;
 
 	const PERSISTENT = process.versions.icu ? '✅' : 'Y ';
 	const NOT_PERSISTENT = process.versions.icu ? '❌' : 'N ';
@@ -18238,8 +19560,8 @@ function requireSnapshotRecorder () {
 	if (hasRequiredSnapshotRecorder) return snapshotRecorder;
 	hasRequiredSnapshotRecorder = 1;
 
-	const { writeFile, readFile, mkdir } = require$$0$5;
-	const { dirname, resolve } = require$$1$4;
+	const { writeFile, readFile, mkdir } = require$$0$6;
+	const { dirname, resolve } = require$$1$5;
 	const { setTimeout, clearTimeout } = require$$2$3;
 	const { InvalidArgumentError, UndiciError } = requireErrors();
 	const { hashId, isUrlExcludedFactory, normalizeHeaders, createHeaderFilters } = requireSnapshotUtils();
@@ -19197,7 +20519,8 @@ function requireGlobal () {
 
 	// We include a version number for the Dispatcher API. In case of breaking changes,
 	// this version number must be increased to avoid conflicts.
-	const globalDispatcher = Symbol.for('undici.globalDispatcher.1');
+	const globalDispatcher = Symbol.for('undici.globalDispatcher.2');
+	const legacyGlobalDispatcher = Symbol.for('undici.globalDispatcher.1');
 	const { InvalidArgumentError } = requireErrors();
 	const Agent = requireAgent();
 
@@ -19209,7 +20532,15 @@ function requireGlobal () {
 	  if (!agent || typeof agent.dispatch !== 'function') {
 	    throw new InvalidArgumentError('Argument agent must implement Agent')
 	  }
+
 	  Object.defineProperty(globalThis, globalDispatcher, {
+	    value: agent,
+	    writable: true,
+	    enumerable: false,
+	    configurable: false
+	  });
+
+	  Object.defineProperty(globalThis, legacyGlobalDispatcher, {
 	    value: agent,
 	    writable: true,
 	    enumerable: false,
@@ -19218,7 +20549,7 @@ function requireGlobal () {
 	}
 
 	function getGlobalDispatcher () {
-	  return globalThis[globalDispatcher]
+	  return globalThis[legacyGlobalDispatcher]
 	}
 
 	// These are the globals that can be installed by undici.install().
@@ -19253,7 +20584,7 @@ function requireDecoratorHandler () {
 	if (hasRequiredDecoratorHandler) return decoratorHandler;
 	hasRequiredDecoratorHandler = 1;
 
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const WrapHandler = requireWrapHandler();
 
 	/**
@@ -19330,9 +20661,9 @@ function requireRedirectHandler () {
 
 	const util = requireUtil$5();
 	const { kBodyUsed } = requireSymbols();
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { InvalidArgumentError } = requireErrors();
-	const EE = require$$6$1;
+	const EE = require$$0;
 
 	const redirectableStatusCodes = [300, 301, 302, 303, 307, 308];
 
@@ -19532,7 +20863,8 @@ function requireRedirectHandler () {
 	      }
 	    }
 	  } else if (headers && typeof headers === 'object') {
-	    const entries = typeof headers[Symbol.iterator] === 'function' ? headers : Object.entries(headers);
+	    const entries = util.hasSafeIterator(headers) ? headers : Object.entries(headers);
+
 	    for (const [key, value] of entries) {
 	      if (!shouldRemoveHeader(key, removeContent, unknownOrigin)) {
 	        ret.push(key, value);
@@ -19707,11 +21039,11 @@ function requireRetry () {
 	return retry;
 }
 
-var dump;
+var dump$1;
 var hasRequiredDump;
 
 function requireDump () {
-	if (hasRequiredDump) return dump;
+	if (hasRequiredDump) return dump$1;
 	hasRequiredDump = 1;
 
 	const { InvalidArgumentError, RequestAbortedError } = requireErrors();
@@ -19823,8 +21155,8 @@ function requireDump () {
 	  }
 	}
 
-	dump = createDumpInterceptor;
-	return dump;
+	dump$1 = createDumpInterceptor;
+	return dump$1;
 }
 
 var dns;
@@ -19833,11 +21165,110 @@ var hasRequiredDns;
 function requireDns () {
 	if (hasRequiredDns) return dns;
 	hasRequiredDns = 1;
-	const { isIP } = require$$0$2;
-	const { lookup } = require$$1$5;
+	const { isIP } = require$$1$1;
+	const { lookup } = require$$1$6;
 	const DecoratorHandler = requireDecoratorHandler();
 	const { InvalidArgumentError, InformationalError } = requireErrors();
 	const maxInt = Math.pow(2, 31) - 1;
+
+	function hasSafeIterator (headers) {
+	  const prototype = Object.getPrototypeOf(headers);
+	  const ownIterator = Object.prototype.hasOwnProperty.call(headers, Symbol.iterator);
+	  return ownIterator || (prototype != null && prototype !== Object.prototype && typeof headers[Symbol.iterator] === 'function')
+	}
+
+	function isHostHeader (key) {
+	  return typeof key === 'string' && key.toLowerCase() === 'host'
+	}
+
+	function normalizeHeaders (headers) {
+	  if (headers == null) {
+	    return null
+	  }
+
+	  if (Array.isArray(headers)) {
+	    if (headers.length === 0 || !Array.isArray(headers[0])) {
+	      return headers
+	    }
+
+	    const normalized = [];
+	    for (const header of headers) {
+	      if (Array.isArray(header) && header.length === 2) {
+	        normalized.push(header[0], header[1]);
+	      } else {
+	        normalized.push(header);
+	      }
+	    }
+
+	    return normalized
+	  }
+
+	  if (typeof headers === 'object' && hasSafeIterator(headers)) {
+	    const normalized = [];
+	    for (const header of headers) {
+	      if (Array.isArray(header) && header.length === 2) {
+	        normalized.push(header[0], header[1]);
+	      } else {
+	        normalized.push(header);
+	      }
+	    }
+
+	    return normalized
+	  }
+
+	  return headers
+	}
+
+	function hasHostHeader (headers) {
+	  if (headers == null) {
+	    return false
+	  }
+
+	  if (Array.isArray(headers)) {
+	    if (headers.length === 0) {
+	      return false
+	    }
+
+	    for (let i = 0; i < headers.length; i += 2) {
+	      if (isHostHeader(headers[i])) {
+	        return true
+	      }
+	    }
+
+	    return false
+	  }
+
+	  if (typeof headers === 'object') {
+	    for (const key in headers) {
+	      if (isHostHeader(key)) {
+	        return true
+	      }
+	    }
+	  }
+
+	  return false
+	}
+
+	function withHostHeader (host, headers) {
+	  const normalizedHeaders = normalizeHeaders(headers);
+
+	  if (hasHostHeader(normalizedHeaders)) {
+	    return normalizedHeaders
+	  }
+
+	  if (Array.isArray(normalizedHeaders)) {
+	    return ['host', host, ...normalizedHeaders]
+	  }
+
+	  if (normalizedHeaders && typeof normalizedHeaders === 'object') {
+	    return {
+	      host,
+	      ...normalizedHeaders
+	    }
+	  }
+
+	  return { host }
+	}
 
 	class DNSStorage {
 	  #maxItems = 0
@@ -20167,8 +21598,9 @@ function requireDns () {
 	          const dispatchOpts = {
 	            ...this.#opts,
 	            origin: `${this.#origin.protocol}//${
-	                ip.family === 6 ? `[${ip.address}]` : ip.address
-	              }${port}`
+	              ip.family === 6 ? `[${ip.address}]` : ip.address
+	            }${port}`,
+	            headers: withHostHeader(this.#origin.host, this.#opts.headers)
 	          };
 	          this.#dispatch(dispatchOpts, this);
 	          return
@@ -20287,10 +21719,7 @@ function requireDns () {
 	          ...origDispatchOpts,
 	          servername: origin.hostname, // For SNI on TLS
 	          origin: newOrigin.origin,
-	          headers: {
-	            host: origin.host,
-	            ...origDispatchOpts.headers
-	          }
+	          headers: withHostHeader(origin.host, origDispatchOpts.headers)
 	        };
 
 	        dispatch(
@@ -20318,10 +21747,147 @@ function requireCache$2 () {
 
 	const {
 	  safeHTTPMethods,
-	  pathHasQueryOrFragment
+	  pathHasQueryOrFragment,
+	  hasSafeIterator,
+	  isValidHTTPToken
 	} = requireUtil$5();
 
 	const { serializePathWithQuery } = requireUtil$5();
+
+	const MAX_DELTA_SECONDS = 2147483647;
+	const RESTRICTIVE_DIRECTIVE_NAMES = ['no-store', 'private', 'no-cache'];
+	const kInvalidCacheControlDirectives = Symbol('invalid cache-control directives');
+
+	function trimOWS (value) {
+	  return value.replace(/^[\t ]+|[\t ]+$/g, '')
+	}
+
+	function arrayIncludes (array, value) {
+	  for (let i = 0; i < array.length; i++) {
+	    if (array[i] === value) {
+	      return true
+	    }
+	  }
+
+	  return false
+	}
+
+	function trimOWSStart (value) {
+	  return value.replace(/^[\t ]+/, '')
+	}
+
+	function trimOWSEnd (value) {
+	  return value.replace(/[\t ]+$/, '')
+	}
+
+	function findUnescapedQuote (value, start) {
+	  let escaped = false;
+	  for (let i = start; i < value.length; i++) {
+	    if (escaped) {
+	      escaped = false;
+	    } else if (value[i] === '\\') {
+	      escaped = true;
+	    } else if (value[i] === '"') {
+	      return i
+	    }
+	  }
+
+	  return -1
+	}
+
+	function splitCacheControlHeaderValue (value) {
+	  const directives = [];
+	  let start = 0;
+	  let quoteStart = -1;
+	  let inQuote = false;
+	  let escaped = false;
+
+	  for (let i = 0; i < value.length; i++) {
+	    if (inQuote) {
+	      if (escaped) {
+	        escaped = false;
+	      } else if (value[i] === '\\') {
+	        escaped = true;
+	      } else if (value[i] === '"') {
+	        inQuote = false;
+	        quoteStart = -1;
+	      }
+	    } else if (value[i] === '"') {
+	      inQuote = true;
+	      quoteStart = i;
+	    } else if (value[i] === ',') {
+	      directives.push({ value: value.substring(start, i), fromMalformedQuote: false });
+	      start = i + 1;
+	    }
+	  }
+
+	  if (!inQuote) {
+	    directives.push({ value: value.substring(start), fromMalformedQuote: false });
+	    return directives
+	  }
+
+	  const tail = value.substring(start);
+	  const quoteOffset = quoteStart - start;
+	  let tailStart = 0;
+	  for (let i = 0; i < tail.length; i++) {
+	    if (tail[i] === ',') {
+	      directives.push({
+	        value: tail.substring(tailStart, i),
+	        fromMalformedQuote: tailStart > quoteOffset
+	      });
+	      tailStart = i + 1;
+	    }
+	  }
+
+	  directives.push({
+	    value: tail.substring(tailStart),
+	    fromMalformedQuote: tailStart > quoteOffset
+	  });
+	  return directives
+	}
+
+	function markInvalidCacheControlDirective (directives, key) {
+	  let invalidDirectives = directives[kInvalidCacheControlDirectives];
+
+	  if (invalidDirectives === undefined) {
+	    invalidDirectives = new Set();
+	    Object.defineProperty(directives, kInvalidCacheControlDirectives, {
+	      value: invalidDirectives
+	    });
+	  }
+
+	  invalidDirectives.add(key);
+	}
+
+	function hasInvalidCacheControlDirective (directives, key) {
+	  return directives[kInvalidCacheControlDirectives]?.has(key) === true
+	}
+
+	function getMalformedRestrictiveDirectiveName (key) {
+	  for (const directiveName of RESTRICTIVE_DIRECTIVE_NAMES) {
+	    if (
+	      key.startsWith(directiveName) &&
+	      key.length > directiveName.length &&
+	      !isValidHTTPToken(key[directiveName.length])
+	    ) {
+	      return directiveName
+	    }
+	  }
+
+	  let tokenOnlyKey = '';
+	  let hasInvalidTokenChar = false;
+	  for (let i = 0; i < key.length; i++) {
+	    if (isValidHTTPToken(key[i])) {
+	      tokenOnlyKey += key[i];
+	    } else {
+	      hasInvalidTokenChar = true;
+	    }
+	  }
+
+	  if (hasInvalidTokenChar && arrayIncludes(RESTRICTIVE_DIRECTIVE_NAMES, tokenOnlyKey)) {
+	    return tokenOnlyKey
+	  }
+	}
 
 	/**
 	 * @param {import('../../types/dispatcher.d.ts').default.DispatchOptions} opts
@@ -20333,7 +21899,7 @@ function requireCache$2 () {
 
 	  let fullPath = opts.path || '/';
 
-	  if (opts.query && !pathHasQueryOrFragment(opts.path)) {
+	  if (opts.query && !pathHasQueryOrFragment(fullPath)) {
 	    fullPath = serializePathWithQuery(fullPath, opts.query);
 	  }
 
@@ -20345,6 +21911,20 @@ function requireCache$2 () {
 	  }
 	}
 
+	function appendHeader (headers, key, val) {
+	  const headerName = key.toLowerCase();
+	  const current = headers[headerName];
+	  const values = Array.isArray(val) ? val : [val];
+
+	  if (current === undefined) {
+	    headers[headerName] = Array.isArray(val) ? val.slice() : val;
+	  } else if (Array.isArray(current)) {
+	    current.push(...values);
+	  } else {
+	    headers[headerName] = [current, ...values];
+	  }
+	}
+
 	/**
 	 * @param {Record<string, string[] | string>}
 	 * @returns {Record<string, string[] | string>}
@@ -20353,23 +21933,24 @@ function requireCache$2 () {
 	  let headers;
 	  if (opts.headers == null) {
 	    headers = {};
-	  } else if (typeof opts.headers[Symbol.iterator] === 'function') {
-	    headers = {};
-	    for (const x of opts.headers) {
-	      if (!Array.isArray(x)) {
-	        throw new Error('opts.headers is not a valid header map')
-	      }
-	      const [key, val] = x;
-	      if (typeof key !== 'string' || typeof val !== 'string') {
-	        throw new Error('opts.headers is not a valid header map')
-	      }
-	      headers[key.toLowerCase()] = val;
-	    }
 	  } else if (typeof opts.headers === 'object') {
 	    headers = {};
 
-	    for (const key of Object.keys(opts.headers)) {
-	      headers[key.toLowerCase()] = opts.headers[key];
+	    if (hasSafeIterator(opts.headers)) {
+	      for (const x of opts.headers) {
+	        if (!Array.isArray(x)) {
+	          throw new Error('opts.headers is not a valid header map')
+	        }
+	        const [key, val] = x;
+	        if (typeof key !== 'string' || typeof val !== 'string') {
+	          throw new Error('opts.headers is not a valid header map')
+	        }
+	        appendHeader(headers, key, val);
+	      }
+	    } else {
+	      for (const key of Object.keys(opts.headers)) {
+	        appendHeader(headers, key, opts.headers[key]);
+	      }
 	    }
 	  } else {
 	    throw new Error('opts.headers is not an object')
@@ -20440,29 +22021,37 @@ function requireCache$2 () {
 	   * @type {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives}
 	   */
 	  const output = {};
+	  const invalidNumericDirectives = new Set();
+	  const invalidNoArgumentDirectives = new Set();
 
-	  let directives;
-	  if (Array.isArray(header)) {
-	    directives = [];
-
-	    for (const directive of header) {
-	      directives.push(...directive.split(','));
-	    }
-	  } else {
-	    directives = header.split(',');
-	  }
+	  const directives = splitCacheControlHeaderValue(Array.isArray(header) ? header.join(',') : header);
 
 	  for (let i = 0; i < directives.length; i++) {
-	    const directive = directives[i].toLowerCase();
+	    const directiveRecord = directives[i];
+	    const directive = directiveRecord.value.toLowerCase();
+	    const fromMalformedQuote = directiveRecord.fromMalformedQuote;
 	    const keyValueDelimiter = directive.indexOf('=');
 
 	    let key;
 	    let value;
+	    let keyHasTrailingWhitespace = false;
+	    let valueHasLeadingWhitespace = false;
 	    if (keyValueDelimiter !== -1) {
-	      key = directive.substring(0, keyValueDelimiter).trimStart();
-	      value = directive.substring(keyValueDelimiter + 1);
+	      const rawKey = directive.substring(0, keyValueDelimiter);
+	      const rawValue = directive.substring(keyValueDelimiter + 1);
+
+	      keyHasTrailingWhitespace = trimOWSEnd(rawKey) !== rawKey;
+	      valueHasLeadingWhitespace = trimOWSStart(rawValue) !== rawValue;
+	      key = trimOWS(rawKey);
+	      value = trimOWSStart(rawValue);
 	    } else {
-	      key = directive.trim();
+	      key = trimOWS(directive);
+	    }
+
+	    const malformedRestrictiveDirectiveName = getMalformedRestrictiveDirectiveName(key);
+	    if (malformedRestrictiveDirectiveName !== undefined) {
+	      output[malformedRestrictiveDirectiveName] = true;
+	      continue
 	    }
 
 	    switch (key) {
@@ -20472,7 +22061,14 @@ function requireCache$2 () {
 	      case 's-maxage':
 	      case 'stale-while-revalidate':
 	      case 'stale-if-error': {
-	        if (value === undefined || value[0] === ' ') {
+	        if (fromMalformedQuote || invalidNumericDirectives.has(key)) {
+	          continue
+	        }
+
+	        if (value === undefined || keyHasTrailingWhitespace || valueHasLeadingWhitespace) {
+	          delete output[key];
+	          invalidNumericDirectives.add(key);
+	          markInvalidCacheControlDirective(output, key);
 	          continue
 	        }
 
@@ -20484,22 +22080,37 @@ function requireCache$2 () {
 	          value = value.substring(1, value.length - 1);
 	        }
 
-	        const parsedValue = parseInt(value, 10);
-	        // eslint-disable-next-line no-self-compare
-	        if (parsedValue !== parsedValue) {
+	        if (!/^[0-9]+$/.test(value)) {
+	          delete output[key];
+	          invalidNumericDirectives.add(key);
+	          markInvalidCacheControlDirective(output, key);
 	          continue
 	        }
 
-	        if (key === 'max-age' && key in output && output[key] >= parsedValue) {
-	          continue
-	        }
+	        const parsedValue = Math.min(parseInt(value, 10), MAX_DELTA_SECONDS);
 
-	        output[key] = parsedValue;
+	        if (key === 'min-fresh') {
+	          if (!(key in output) || output[key] < parsedValue) {
+	            output[key] = parsedValue;
+	          }
+	        } else if (!(key in output) || output[key] > parsedValue) {
+	          output[key] = parsedValue;
+	        }
 
 	        break
 	      }
 	      case 'private':
 	      case 'no-cache': {
+	        if (fromMalformedQuote) {
+	          output[key] = true;
+	          break
+	        }
+
+	        if (value !== undefined && value.length === 0) {
+	          output[key] = true;
+	          break
+	        }
+
 	        if (value) {
 	          // The private and no-cache directives can be unqualified (aka just
 	          //  `private` or `no-cache`) or qualified (w/ a value). When they're
@@ -20507,41 +22118,64 @@ function requireCache$2 () {
 	          //  `no-cache="header1"`, or `no-cache="header1, header2"`
 	          // If we're given multiple headers, the comma messes us up since
 	          //  we split the full header by commas. So, let's loop through the
-	          //  remaining parts in front of us until we find one that ends in a
-	          //  quote. We can then just splice all of the parts in between the
-	          //  starting quote and the ending quote out of the directives array
-	          //  and continue parsing like normal.
+	          //  remaining parts in front of us until we find one that contains a
+	          //  closing quote. We can then skip the consumed quoted-list fragments and
+	          //  continue parsing like normal.
 	          // https://www.rfc-editor.org/rfc/rfc9111.html#name-no-cache-2
 	          if (value[0] === '"') {
 	            // Something like `no-cache="some-header"` OR `no-cache="some-header, another-header"`.
+	            value = trimOWSEnd(value);
 
-	            // Add the first header on and cut off the leading quote
-	            const headers = [value.substring(1)];
+	            let fieldList = '';
+	            let lastQuotedPart = i;
+	            let foundEndingQuote = false;
+	            const closingQuote = findUnescapedQuote(value, 1);
 
-	            let foundEndingQuote = value[value.length - 1] === '"';
-	            if (!foundEndingQuote) {
+	            if (closingQuote !== -1) {
+	              fieldList = value.substring(1, closingQuote);
+	              foundEndingQuote = true;
+	            } else {
 	              // Something like `no-cache="some-header, another-header"`
 	              //  This can still be something invalid, e.g. `no-cache="some-header, ...`
+	              const fieldListParts = [value.substring(1)];
+
 	              for (let j = i + 1; j < directives.length; j++) {
-	                const nextPart = directives[j];
-	                const nextPartLength = nextPart.length;
+	                const nextPart = trimOWS(directives[j].value);
+	                const closingQuote = findUnescapedQuote(nextPart, 0);
 
-	                headers.push(nextPart.trim());
+	                lastQuotedPart = j;
 
-	                if (nextPartLength !== 0 && nextPart[nextPartLength - 1] === '"') {
+	                if (closingQuote !== -1) {
+	                  fieldListParts.push(nextPart.substring(0, closingQuote));
 	                  foundEndingQuote = true;
 	                  break
 	                }
+
+	                fieldListParts.push(nextPart);
+	              }
+
+	              fieldList = fieldListParts.join(',');
+	            }
+
+	            if (!foundEndingQuote) {
+	              output[key] = true;
+	              break
+	            }
+
+	            i = lastQuotedPart;
+
+	            const headers = fieldList.split(',');
+	            let validFieldNames = true;
+	            for (let j = 0; j < headers.length; j++) {
+	              headers[j] = trimOWS(headers[j]);
+	              if (!isValidHTTPToken(headers[j])) {
+	                validFieldNames = false;
 	              }
 	            }
 
-	            if (foundEndingQuote) {
-	              let lastHeader = headers[headers.length - 1];
-	              if (lastHeader[lastHeader.length - 1] === '"') {
-	                lastHeader = lastHeader.substring(0, lastHeader.length - 1);
-	                headers[headers.length - 1] = lastHeader;
-	              }
-
+	            if (!validFieldNames) {
+	              output[key] = true;
+	            } else if (output[key] !== true) {
 	              if (key in output) {
 	                output[key] = output[key].concat(headers);
 	              } else {
@@ -20549,11 +22183,17 @@ function requireCache$2 () {
 	              }
 	            }
 	          } else {
-	            // Something like `no-cache="some-header"`
-	            if (key in output) {
-	              output[key] = output[key].concat(value);
-	            } else {
-	              output[key] = [value];
+	            // Something like `no-cache=some-header`
+	            const fieldName = trimOWS(value);
+
+	            if (!isValidHTTPToken(fieldName)) {
+	              output[key] = true;
+	            } else if (output[key] !== true) {
+	              if (key in output) {
+	                output[key] = output[key].concat(fieldName);
+	              } else {
+	                output[key] = [fieldName];
+	              }
 	            }
 	          }
 
@@ -20562,19 +22202,27 @@ function requireCache$2 () {
 	      }
 	      // eslint-disable-next-line no-fallthrough
 	      case 'public':
-	      case 'no-store':
 	      case 'must-revalidate':
 	      case 'proxy-revalidate':
 	      case 'immutable':
 	      case 'no-transform':
 	      case 'must-understand':
 	      case 'only-if-cached':
-	        if (value) {
-	          // These are qualified (something like `public=...`) when they aren't
-	          //  allowed to be, skip
+	        if (fromMalformedQuote || invalidNoArgumentDirectives.has(key)) {
 	          continue
 	        }
 
+	        if (value !== undefined) {
+	          // These are qualified (something like `public=...`) when they aren't
+	          //  allowed to be, skip all instances of the malformed directive.
+	          delete output[key];
+	          invalidNoArgumentDirectives.add(key);
+	          continue
+	        }
+
+	        output[key] = true;
+	        break
+	      case 'no-store':
 	        output[key] = true;
 	        break
 	      default:
@@ -20588,27 +22236,75 @@ function requireCache$2 () {
 
 	/**
 	 * @param {string | string[]} varyHeader Vary header from the server
+	 * @returns {string[]}
+	 */
+	function splitVaryHeader (varyHeader) {
+	  const values = Array.isArray(varyHeader) ? varyHeader : [varyHeader];
+	  const output = [];
+
+	  for (let i = 0; i < values.length; i++) {
+	    const parts = values[i].split(',');
+	    for (let j = 0; j < parts.length; j++) {
+	      output.push(parts[j]);
+	    }
+	  }
+
+	  return output
+	}
+
+	/**
+	 * @param {string | string[]} varyHeader Vary header from the server
+	 * @returns {boolean}
+	 */
+	function hasVaryStar (varyHeader) {
+	  const values = splitVaryHeader(varyHeader);
+	  for (let i = 0; i < values.length; i++) {
+	    if (trimOWS(values[i]).indexOf('*') !== -1) {
+	      return true
+	    }
+	  }
+
+	  return false
+	}
+
+	/**
+	 * @param {string | string[]} varyHeader Vary header from the server
 	 * @param {Record<string, string | string[]>} headers Request headers
-	 * @returns {Record<string, string | string[]>}
+	 * @returns {Record<string, string | string[] | null> | undefined}
 	 */
 	function parseVaryHeader (varyHeader, headers) {
-	  if (typeof varyHeader === 'string' && varyHeader.includes('*')) {
+	  if (hasVaryStar(varyHeader)) {
 	    return headers
 	  }
 
 	  const output = /** @type {Record<string, string | string[] | null>} */ ({});
 
-	  const varyingHeaders = typeof varyHeader === 'string'
-	    ? varyHeader.split(',')
-	    : varyHeader;
+	  const varyingHeaders = splitVaryHeader(varyHeader);
 
 	  for (const header of varyingHeaders) {
-	    const trimmedHeader = header.trim().toLowerCase();
+	    const trimmedHeader = trimOWS(header).toLowerCase();
 
-	    output[trimmedHeader] = headers[trimmedHeader] ?? null;
+	    if (trimmedHeader.length === 0) {
+	      continue
+	    }
+
+	    if (!isValidHTTPToken(trimmedHeader)) {
+	      return undefined
+	    }
+
+	    const headerValue = headers[trimmedHeader];
+	    output[trimmedHeader] = Array.isArray(headerValue) ? headerValue.slice() : headerValue ?? null;
 	  }
 
 	  return output
+	}
+
+	/**
+	 * @param {string | string[]} varyHeader Vary header from the server
+	 * @returns {boolean}
+	 */
+	function isInvalidOrWildcardVaryHeader (varyHeader) {
+	  return hasVaryStar(varyHeader) || parseVaryHeader(varyHeader, {}) === undefined
 	}
 
 	/**
@@ -20674,7 +22370,7 @@ function requireCache$2 () {
 	  }
 
 	  for (const method of methods) {
-	    if (!safeHTTPMethods.includes(method)) {
+	    if (!arrayIncludes(safeHTTPMethods, method)) {
 	      throw new TypeError(`element of ${name}-array needs to be one of following values: ${safeHTTPMethods.join(', ')}, got ${method}`)
 	    }
 	  }
@@ -20688,9 +22384,11 @@ function requireCache$2 () {
 	 * @returns {string}
 	 */
 	function makeDeduplicationKey (cacheKey, excludeHeaders) {
-	  // Create a deterministic string key from the cache key
-	  // Include origin, method, path, and sorted headers
-	  let key = `${cacheKey.origin}:${cacheKey.method}:${cacheKey.path}`;
+	  // Use JSON.stringify to produce a collision-resistant key.
+	  // Previous format used `:` and `=` delimiters without escaping, which
+	  // allowed different header sets to produce identical keys (e.g.
+	  // {a:"x:b=y"} vs {a:"x", b:"y"}). See: https://github.com/nodejs/undici/issues/5012
+	  const headers = {};
 
 	  if (cacheKey.headers) {
 	    const sortedHeaders = Object.keys(cacheKey.headers).sort();
@@ -20699,12 +22397,11 @@ function requireCache$2 () {
 	      if (excludeHeaders?.has(header.toLowerCase())) {
 	        continue
 	      }
-	      const value = cacheKey.headers[header];
-	      key += `:${header}=${Array.isArray(value) ? value.join(',') : value}`;
+	      headers[header] = cacheKey.headers[header];
 	    }
 	  }
 
-	  return key
+	  return JSON.stringify([cacheKey.origin, cacheKey.method, cacheKey.path, headers])
 	}
 
 	cache$2 = {
@@ -20713,7 +22410,10 @@ function requireCache$2 () {
 	  assertCacheKey,
 	  assertCacheValue,
 	  parseCacheControlHeader,
+	  hasInvalidCacheControlDirective,
 	  parseVaryHeader,
+	  hasVaryStar,
+	  isInvalidOrWildcardVaryHeader,
 	  isEtagUsable,
 	  assertCacheMethods,
 	  assertCacheStore,
@@ -20745,6 +22445,26 @@ function requireDate () {
 	    case ' ': return parseAscTimeDate(date)
 	    default: return parseRfc850Date(date)
 	  }
+	}
+
+	function makeDate (year, monthIdx, day, hour, minute, second, weekday) {
+	  const result = new Date(Date.UTC(year, monthIdx, day, hour, minute, second));
+
+	  // Date.UTC treats years 0-99 as 1900-1999. Reset the full year so component
+	  // checks below validate the HTTP date as written.
+	  if (year >= 0 && year <= 99) {
+	    result.setUTCFullYear(year);
+	  }
+
+	  return result.getUTCFullYear() === year &&
+	    result.getUTCMonth() === monthIdx &&
+	    result.getUTCDate() === day &&
+	    result.getUTCHours() === hour &&
+	    result.getUTCMinutes() === minute &&
+	    result.getUTCSeconds() === second &&
+	    result.getUTCDay() === weekday
+	    ? result
+	    : undefined
 	}
 
 	/**
@@ -20953,8 +22673,7 @@ function requireDate () {
 	    second = (code1 - 48) * 10 + (code2 - 48); // Convert ASCII codes to number
 	  }
 
-	  const result = new Date(Date.UTC(year, monthIdx, day, hour, minute, second));
-	  return result.getUTCDay() === weekday ? result : undefined
+	  return makeDate(year, monthIdx, day, hour, minute, second, weekday)
 	}
 
 	/**
@@ -21158,8 +22877,7 @@ function requireDate () {
 	  }
 	  const year = (yearDigit1 - 48) * 1000 + (yearDigit2 - 48) * 100 + (yearDigit3 - 48) * 10 + (yearDigit4 - 48);
 
-	  const result = new Date(Date.UTC(year, monthIdx, day, hour, minute, second));
-	  return result.getUTCDay() === weekday ? result : undefined
+	  return makeDate(year, monthIdx, day, hour, minute, second, weekday)
 	}
 
 	/**
@@ -21373,8 +23091,7 @@ function requireDate () {
 	    second = (code1 - 48) * 10 + (code2 - 48); // Convert ASCII codes to number
 	  }
 
-	  const result = new Date(Date.UTC(year, monthIdx, day, hour, minute, second));
-	  return result.getUTCDay() === weekday ? result : undefined
+	  return makeDate(year, monthIdx, day, hour, minute, second, weekday)
 	}
 
 	date = {
@@ -21393,7 +23110,10 @@ function requireCacheHandler () {
 	const util = requireUtil$5();
 	const {
 	  parseCacheControlHeader,
+	  hasInvalidCacheControlDirective,
 	  parseVaryHeader,
+	  hasVaryStar,
+	  isInvalidOrWildcardVaryHeader,
 	  isEtagUsable
 	} = requireCache$2();
 	const { parseHttpDate } = requireDate();
@@ -21415,6 +23135,92 @@ function requireCacheHandler () {
 	];
 
 	const MAX_RESPONSE_AGE = 2147483647000;
+
+	function trimOWS (value) {
+	  return value.replace(/^[\t ]+|[\t ]+$/g, '')
+	}
+
+	function arrayIncludes (array, value) {
+	  for (let i = 0; i < array.length; i++) {
+	    if (array[i] === value) {
+	      return true
+	    }
+	  }
+
+	  return false
+	}
+
+	function appendConnectionHeaderTokens (headersToRemove, connectionHeader) {
+	  const values = Array.isArray(connectionHeader) ? connectionHeader : [connectionHeader];
+
+	  for (let i = 0; i < values.length; i++) {
+	    const tokens = values[i].split(',');
+	    for (let j = 0; j < tokens.length; j++) {
+	      headersToRemove.push(trimOWS(tokens[j]).toLowerCase());
+	    }
+	  }
+	}
+
+	function getSameOriginPath (cacheKey, location) {
+	  if (typeof location !== 'string') {
+	    return undefined
+	  }
+
+	  let originUrl;
+	  let requestUrl;
+	  let locationUrl;
+	  try {
+	    originUrl = new URL(cacheKey.origin);
+	    requestUrl = new URL(cacheKey.path, originUrl);
+	    locationUrl = new URL(location, requestUrl);
+	  } catch {
+	    return undefined
+	  }
+
+	  if (locationUrl.origin !== originUrl.origin) {
+	    return undefined
+	  }
+
+	  return locationUrl.pathname + locationUrl.search
+	}
+
+	function deleteCachedUri (store, cacheKey, path) {
+	  deleteCachedValue(store, {
+	    ...cacheKey,
+	    path
+	  });
+
+	  for (let i = 0; i < util.safeHTTPMethods.length; i++) {
+	    const method = util.safeHTTPMethods[i];
+	    if (method !== cacheKey.method) {
+	      deleteCachedValue(store, {
+	        ...cacheKey,
+	        method,
+	        path
+	      });
+	    }
+	  }
+	}
+
+	function deleteLocationTargets (store, cacheKey, headerValue) {
+	  if (headerValue === undefined) {
+	    return
+	  }
+
+	  const values = Array.isArray(headerValue) ? headerValue : [headerValue];
+	  for (let i = 0; i < values.length; i++) {
+	    const path = getSameOriginPath(cacheKey, values[i]);
+	    if (path !== undefined) {
+	      deleteCachedUri(store, cacheKey, path);
+	    }
+	  }
+	}
+
+	function invalidateUnsafeRequest (store, cacheKey, resHeaders) {
+	  deleteCachedUri(store, cacheKey, cacheKey.path);
+	  deleteLocationTargets(store, cacheKey, resHeaders.location);
+	  deleteLocationTargets(store, cacheKey, resHeaders['content-location']);
+	}
 
 	/**
 	 * @typedef {import('../../types/dispatcher.d.ts').default.DispatchHandler} DispatchHandler
@@ -21497,60 +23303,75 @@ function requireCacheHandler () {
 	    const handler = this;
 
 	    if (
-	      !util.safeHTTPMethods.includes(this.#cacheKey.method) &&
+	      !arrayIncludes(util.safeHTTPMethods, this.#cacheKey.method) &&
 	      statusCode >= 200 &&
 	      statusCode <= 399
 	    ) {
 	      // Successful response to an unsafe method, delete it from cache
 	      //  https://www.rfc-editor.org/rfc/rfc9111.html#name-invalidating-stored-response
-	      try {
-	        this.#store.delete(this.#cacheKey)?.catch?.(noop);
-	      } catch {
-	        // Fail silently
-	      }
+	      invalidateUnsafeRequest(this.#store, this.#cacheKey, resHeaders);
 	      return downstreamOnHeaders()
 	    }
 
 	    const cacheControlHeader = resHeaders['cache-control'];
-	    const heuristicallyCacheable = resHeaders['last-modified'] && HEURISTICALLY_CACHEABLE_STATUS_CODES.includes(statusCode);
+	    const heuristicallyCacheable = resHeaders['last-modified'] && arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode);
 	    if (
 	      !cacheControlHeader &&
 	      !resHeaders['expires'] &&
 	      !heuristicallyCacheable &&
 	      !this.#cacheByDefault
 	    ) {
+	      if (statusCode === 304 && resHeaders.vary && isInvalidOrWildcardVaryHeader(resHeaders.vary)) {
+	        deleteCachedValue(this.#store, this.#cacheKey);
+	      }
+
 	      // Don't have anything to tell us this response is cachable and we're not
 	      //  caching by default
 	      return downstreamOnHeaders()
 	    }
 
 	    const cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {};
-	    if (!canCacheResponse(this.#cacheType, statusCode, resHeaders, cacheControlDirectives)) {
+	    if (!canCacheResponse(this.#cacheType, statusCode, resHeaders, cacheControlDirectives, this.#cacheKey.headers)) {
+	      if (statusCode === 304 && (cacheControlHeader || revalidationResponseDisallowsCachedReuse(this.#cacheType, resHeaders, cacheControlDirectives))) {
+	        deleteCachedValue(this.#store, this.#cacheKey);
+	      }
+
 	      return downstreamOnHeaders()
 	    }
 
 	    const now = Date.now();
-	    const resAge = resHeaders.age ? getAge(resHeaders.age) : undefined;
-	    if (resAge && resAge >= MAX_RESPONSE_AGE) {
+	    const resAge = Object.hasOwn(resHeaders, 'age') ? getAge(resHeaders.age) : undefined;
+	    if (resAge !== undefined && resAge >= MAX_RESPONSE_AGE) {
 	      // Response considered stale
+	      deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey);
 	      return downstreamOnHeaders()
 	    }
 
-	    const resDate = typeof resHeaders.date === 'string'
-	      ? parseHttpDate(resHeaders.date)
-	      : undefined;
+	    const resDate = Object.hasOwn(resHeaders, 'date') ? getDate(resHeaders.date) : undefined;
+	    if (resDate === null) {
+	      deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey);
+	      return downstreamOnHeaders()
+	    }
+
+	    const apparentAge = resDate ? Math.max(0, now - resDate.getTime()) : 0;
+	    const currentAge = Math.max(apparentAge, resAge ?? 0);
 
 	    const staleAt =
 	      determineStaleAt(this.#cacheType, now, resAge, resHeaders, resDate, cacheControlDirectives) ??
 	      this.#cacheByDefault;
-	    if (staleAt === undefined || (resAge && resAge > staleAt)) {
+	    if (staleAt === undefined || currentAge >= staleAt) {
+	      if (cacheControlHeader || staleAt !== undefined) {
+	        deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey);
+	      }
+
 	      return downstreamOnHeaders()
 	    }
 
-	    const baseTime = resDate ? resDate.getTime() : now;
+	    const baseTime = now - currentAge;
 	    const absoluteStaleAt = staleAt + baseTime;
 	    if (now >= absoluteStaleAt) {
 	      // Response is already stale
+	      deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey);
 	      return downstreamOnHeaders()
 	    }
 
@@ -21563,7 +23384,8 @@ function requireCacheHandler () {
 	      }
 	    }
 
-	    const deleteAt = determineDeleteAt(baseTime, cacheControlDirectives, absoluteStaleAt);
+	    const cachedAt = baseTime;
+	    const deleteAt = determineDeleteAt(baseTime, now, cacheControlDirectives, absoluteStaleAt);
 	    const strippedHeaders = stripNecessaryHeaders(resHeaders, cacheControlDirectives);
 
 	    /**
@@ -21575,7 +23397,7 @@ function requireCacheHandler () {
 	      headers: strippedHeaders,
 	      vary: varyDirectives,
 	      cacheControlDirectives,
-	      cachedAt: resAge ? now - resAge : now,
+	      cachedAt,
 	      staleAt: absoluteStaleAt,
 	      deleteAt
 	    };
@@ -21593,6 +23415,7 @@ function requireCacheHandler () {
 	        value.statusCode = cachedValue.statusCode;
 	        value.statusMessage = cachedValue.statusMessage;
 	        value.etag = cachedValue.etag;
+	        value.vary = varyDirectives ?? cachedValue.vary;
 	        value.headers = { ...cachedValue.headers, ...strippedHeaders };
 
 	        downstreamOnHeaders();
@@ -21724,21 +23547,52 @@ function requireCacheHandler () {
 	}
 
 	/**
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheStore} store
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} cacheKey
+	 */
+	function deleteCachedValue (store, cacheKey) {
+	  try {
+	    store.delete(cacheKey)?.catch?.(noop);
+	  } catch {
+	    // Fail silently
+	  }
+	}
+
+	function deleteCachedValueIfNotModified (statusCode, store, cacheKey) {
+	  if (statusCode === 304) {
+	    deleteCachedValue(store, cacheKey);
+	  }
+	}
+
+	/**
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders} resHeaders
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives} cacheControlDirectives
+	 * @returns {boolean}
+	 */
+	function revalidationResponseDisallowsCachedReuse (cacheType, resHeaders, cacheControlDirectives) {
+	  return cacheControlDirectives['no-store'] === true ||
+	    (cacheType === 'shared' && cacheControlDirectives.private === true) ||
+	    (resHeaders.vary ? isInvalidOrWildcardVaryHeader(resHeaders.vary) : false)
+	}
+
+	/**
 	 * @see https://www.rfc-editor.org/rfc/rfc9111.html#name-storing-responses-to-authen
 	 *
 	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
 	 * @param {number} statusCode
 	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders} resHeaders
 	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives} cacheControlDirectives
+	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders} [reqHeaders]
 	 */
-	function canCacheResponse (cacheType, statusCode, resHeaders, cacheControlDirectives) {
+	function canCacheResponse (cacheType, statusCode, resHeaders, cacheControlDirectives, reqHeaders) {
 	  // Status code must be final and understood.
-	  if (statusCode < 200 || NOT_UNDERSTOOD_STATUS_CODES.includes(statusCode)) {
+	  if (statusCode < 200 || arrayIncludes(NOT_UNDERSTOOD_STATUS_CODES, statusCode)) {
 	    return false
 	  }
 	  // Responses with neither status codes that are heuristically cacheable, nor "explicit enough" caching
 	  // directives, are not cacheable. "Explicit enough": see https://www.rfc-editor.org/rfc/rfc9111.html#section-3
-	  if (!HEURISTICALLY_CACHEABLE_STATUS_CODES.includes(statusCode) && !resHeaders['expires'] &&
+	  if (!arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode) && !resHeaders['expires'] &&
 	    !cacheControlDirectives.public &&
 	    cacheControlDirectives['max-age'] === undefined &&
 	    // RFC 9111: a private response directive, if the cache is not shared
@@ -21757,26 +23611,34 @@ function requireCacheHandler () {
 	  }
 
 	  // https://www.rfc-editor.org/rfc/rfc9111.html#section-4.1-5
-	  if (resHeaders.vary?.includes('*')) {
+	  if (resHeaders.vary && hasVaryStar(resHeaders.vary)) {
 	    return false
 	  }
 
 	  // https://www.rfc-editor.org/rfc/rfc9111.html#name-storing-responses-to-authen
-	  if (resHeaders.authorization) {
-	    if (!cacheControlDirectives.public || typeof resHeaders.authorization !== 'string') {
+	  if (reqHeaders != null && Object.hasOwn(reqHeaders, 'authorization')) {
+	    if (
+	      !cacheControlDirectives.public &&
+	      !cacheControlDirectives['s-maxage'] &&
+	      !cacheControlDirectives['must-revalidate']
+	    ) {
+	      return false
+	    }
+
+	    if (typeof reqHeaders.authorization !== 'string') {
 	      return false
 	    }
 
 	    if (
 	      Array.isArray(cacheControlDirectives['no-cache']) &&
-	      cacheControlDirectives['no-cache'].includes('authorization')
+	      arrayIncludes(cacheControlDirectives['no-cache'], 'authorization')
 	    ) {
 	      return false
 	    }
 
 	    if (
 	      Array.isArray(cacheControlDirectives['private']) &&
-	      cacheControlDirectives['private'].includes('authorization')
+	      arrayIncludes(cacheControlDirectives['private'], 'authorization')
 	    ) {
 	      return false
 	    }
@@ -21786,13 +23648,50 @@ function requireCacheHandler () {
 	}
 
 	/**
+	 * @param {string | string[]} dateHeader
+	 * @returns {Date | null | undefined}
+	 */
+	function getDate (dateHeader) {
+	  let dateValue = dateHeader;
+	  if (Array.isArray(dateValue)) {
+	    if (dateValue.length !== 1) {
+	      return null
+	    }
+
+	    dateValue = dateValue[0];
+	  }
+
+	  if (typeof dateValue !== 'string') {
+	    return null
+	  }
+
+	  return parseHttpDate(dateValue)
+	}
+
+	/**
 	 * @param {string | string[]} ageHeader
 	 * @returns {number | undefined}
 	 */
 	function getAge (ageHeader) {
-	  const age = parseInt(Array.isArray(ageHeader) ? ageHeader[0] : ageHeader);
+	  let ageValue = ageHeader;
+	  if (Array.isArray(ageValue)) {
+	    if (ageValue.length !== 1) {
+	      return MAX_RESPONSE_AGE
+	    }
 
-	  return isNaN(age) ? undefined : age * 1000
+	    ageValue = ageValue[0];
+	  }
+
+	  if (typeof ageValue !== 'string' || !/^[\t ]*[0-9]+[\t ]*$/.test(ageValue)) {
+	    return MAX_RESPONSE_AGE
+	  }
+
+	  const age = BigInt(ageValue.replace(/^[\t ]+|[\t ]+$/g, ''));
+	  if (age >= BigInt(MAX_RESPONSE_AGE / 1000)) {
+	    return MAX_RESPONSE_AGE
+	  }
+
+	  return Number(age) * 1000
 	}
 
 	/**
@@ -21810,43 +23709,60 @@ function requireCacheHandler () {
 	    // Prioritize s-maxage since we're a shared cache
 	    //  s-maxage > max-age > Expire
 	    //  https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.10-3
+	    if (hasInvalidCacheControlDirective(cacheControlDirectives, 's-maxage')) {
+	      return 0
+	    }
+
 	    const sMaxAge = cacheControlDirectives['s-maxage'];
 	    if (sMaxAge !== undefined) {
-	      return sMaxAge > 0 ? sMaxAge * 1000 : undefined
+	      return sMaxAge * 1000
 	    }
+	  }
+
+	  if (hasInvalidCacheControlDirective(cacheControlDirectives, 'max-age')) {
+	    return 0
 	  }
 
 	  const maxAge = cacheControlDirectives['max-age'];
 	  if (maxAge !== undefined) {
-	    return maxAge > 0 ? maxAge * 1000 : undefined
+	    return maxAge * 1000
 	  }
 
-	  if (typeof resHeaders.expires === 'string') {
+	  if (Object.hasOwn(resHeaders, 'expires')) {
 	    // https://www.rfc-editor.org/rfc/rfc9111.html#section-5.3
-	    const expiresDate = parseHttpDate(resHeaders.expires);
-	    if (expiresDate) {
-	      if (now >= expiresDate.getTime()) {
-	        return undefined
-	      }
-
-	      if (responseDate) {
-	        if (responseDate >= expiresDate) {
-	          return undefined
-	        }
-
-	        if (age !== undefined && age > (expiresDate - responseDate)) {
-	          return undefined
-	        }
-	      }
-
-	      return expiresDate.getTime() - now
+	    if (typeof resHeaders.expires !== 'string') {
+	      return 0
 	    }
+
+	    const expiresDate = parseHttpDate(resHeaders.expires);
+	    if (!expiresDate) {
+	      return 0
+	    }
+
+	    if (now >= expiresDate.getTime()) {
+	      return 0
+	    }
+
+	    if (responseDate) {
+	      if (responseDate >= expiresDate) {
+	        return 0
+	      }
+
+	      const freshnessLifetime = expiresDate.getTime() - responseDate.getTime();
+	      if (age !== undefined && age >= freshnessLifetime) {
+	        return 0
+	      }
+
+	      return freshnessLifetime
+	    }
+
+	    return expiresDate.getTime() - now
 	  }
 
 	  if (typeof resHeaders['last-modified'] === 'string') {
 	    // https://www.rfc-editor.org/rfc/rfc9111.html#name-calculating-heuristic-fresh
-	    const lastModified = new Date(resHeaders['last-modified']);
-	    if (isValidDate(lastModified)) {
+	    const lastModified = parseHttpDate(resHeaders['last-modified']);
+	    if (lastModified) {
 	      if (lastModified.getTime() >= now) {
 	        return undefined
 	      }
@@ -21859,18 +23775,19 @@ function requireCacheHandler () {
 
 	  if (cacheControlDirectives.immutable) {
 	    // https://www.rfc-editor.org/rfc/rfc8246.html#section-2.2
-	    return 31536000
+	    return 31536000000
 	  }
 
 	  return undefined
 	}
 
 	/**
-	 * @param {number} now
+	 * @param {number} baseTime
+	 * @param {number} cachedAt
 	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives} cacheControlDirectives
 	 * @param {number} staleAt
 	 */
-	function determineDeleteAt (now, cacheControlDirectives, staleAt) {
+	function determineDeleteAt (baseTime, cachedAt, cacheControlDirectives, staleAt) {
 	  let staleWhileRevalidate = -Infinity;
 	  let staleIfError = -Infinity;
 	  let immutable = -Infinity;
@@ -21883,8 +23800,22 @@ function requireCacheHandler () {
 	    staleIfError = staleAt + (cacheControlDirectives['stale-if-error'] * 1000);
 	  }
 
-	  if (staleWhileRevalidate === -Infinity && staleIfError === -Infinity) {
-	    immutable = now + 31536000000;
+	  if (cacheControlDirectives.immutable && staleWhileRevalidate === -Infinity && staleIfError === -Infinity) {
+	    immutable = cachedAt + 31536000000;
+	  }
+
+	  // When no stale directives or immutable flag, add a revalidation buffer
+	  // equal to the freshness lifetime so the entry survives past staleAt long
+	  // enough to be revalidated instead of silently disappearing.
+	  //
+	  // Response Date headers only have second precision, so baseTime can trail the
+	  // actual cache insertion time by up to ~1s. Pad the buffer by that bounded
+	  // skew so short-lived entries do not disappear exactly when they should be
+	  // revalidated.
+	  if (staleWhileRevalidate === -Infinity && staleIfError === -Infinity && immutable === -Infinity) {
+	    const freshnessLifetime = staleAt - baseTime;
+	    const datePrecisionPadding = Math.min(Math.max(cachedAt - baseTime, 0), 1000);
+	    return staleAt + freshnessLifetime + datePrecisionPadding
 	  }
 
 	  return Math.max(staleAt, staleWhileRevalidate, staleIfError, immutable)
@@ -21911,14 +23842,7 @@ function requireCacheHandler () {
 	  ];
 
 	  if (resHeaders['connection']) {
-	    if (Array.isArray(resHeaders['connection'])) {
-	      // connection: a
-	      // connection: b
-	      headersToRemove.push(...resHeaders['connection'].map(header => header.trim()));
-	    } else {
-	      // connection: a, b
-	      headersToRemove.push(...resHeaders['connection'].split(',').map(header => header.trim()));
-	    }
+	    appendConnectionHeaderTokens(headersToRemove, resHeaders['connection']);
 	  }
 
 	  if (Array.isArray(cacheControlDirectives['no-cache'])) {
@@ -21931,21 +23855,13 @@ function requireCacheHandler () {
 
 	  let strippedHeaders;
 	  for (const headerName of headersToRemove) {
-	    if (resHeaders[headerName]) {
+	    if (Object.hasOwn(resHeaders, headerName)) {
 	      strippedHeaders ??= { ...resHeaders };
 	      delete strippedHeaders[headerName];
 	    }
 	  }
 
 	  return strippedHeaders ?? resHeaders
-	}
-
-	/**
-	 * @param {Date} date
-	 * @returns {boolean}
-	 */
-	function isValidDate (date) {
-	  return date instanceof Date && Number.isFinite(date.valueOf())
 	}
 
 	cacheHandler = CacheHandler;
@@ -21959,8 +23875,8 @@ function requireMemoryCacheStore () {
 	if (hasRequiredMemoryCacheStore) return memoryCacheStore;
 	hasRequiredMemoryCacheStore = 1;
 
-	const { Writable } = require$$0$1;
-	const { EventEmitter } = require$$6$1;
+	const { Writable } = require$$0$2;
+	const { EventEmitter } = require$$0;
 	const { assertCacheKey, assertCacheValue } = requireCache$2();
 
 	/**
@@ -22177,17 +24093,62 @@ function requireMemoryCacheStore () {
 	}
 
 	function findEntry (key, entries, now) {
-	  return entries.find((entry) => (
-	    entry.deleteAt > now &&
-	    entry.method === key.method &&
-	    (entry.vary == null || Object.keys(entry.vary).every(headerName => {
-	      if (entry.vary[headerName] === null) {
-	        return key.headers[headerName] === undefined
-	      }
+	  for (let i = 0; i < entries.length; i++) {
+	    const entry = entries[i];
+	    if (
+	      entry.deleteAt > now &&
+	      entry.method === key.method &&
+	      varyMatches(key, entry)
+	    ) {
+	      return entry
+	    }
+	  }
+	}
 
-	      return entry.vary[headerName] === key.headers[headerName]
-	    }))
-	  ))
+	function varyMatches (key, entry) {
+	  if (entry.vary == null) {
+	    return true
+	  }
+
+	  for (const headerName in entry.vary) {
+	    if (Object.hasOwn(entry.vary, headerName) && !headerValueEquals(key.headers?.[headerName], entry.vary[headerName])) {
+	      return false
+	    }
+	  }
+
+	  return true
+	}
+
+	/**
+	 * @param {string|string[]|null|undefined} lhs
+	 * @param {string|string[]|null|undefined} rhs
+	 * @returns {boolean}
+	 */
+	function headerValueEquals (lhs, rhs) {
+	  if (lhs == null && rhs == null) {
+	    return true
+	  }
+
+	  if ((lhs == null && rhs != null) ||
+	      (lhs != null && rhs == null)) {
+	    return false
+	  }
+
+	  if (Array.isArray(lhs) && Array.isArray(rhs)) {
+	    if (lhs.length !== rhs.length) {
+	      return false
+	    }
+
+	    for (let i = 0; i < lhs.length; i++) {
+	      if (lhs[i] !== rhs[i]) {
+	        return false
+	      }
+	    }
+
+	    return true
+	  }
+
+	  return lhs === rhs
 	}
 
 	memoryCacheStore = MemoryCacheStore;
@@ -22201,7 +24162,7 @@ function requireCacheRevalidationHandler () {
 	if (hasRequiredCacheRevalidationHandler) return cacheRevalidationHandler;
 	hasRequiredCacheRevalidationHandler = 1;
 
-	const assert = require$$0;
+	const assert = require$$0$1;
 
 	/**
 	 * This takes care of revalidation requests we send to the origin. If we get
@@ -22220,7 +24181,7 @@ function requireCacheRevalidationHandler () {
 	  #successful = false
 
 	  /**
-	   * @type {((boolean, any) => void) | null}
+	   * @type {((success: boolean, context?: any, statusCode?: number, headers?: import('../../types/header.d.ts').IncomingHttpHeaders) => void) | null}
 	   */
 	  #callback
 
@@ -22237,7 +24198,7 @@ function requireCacheRevalidationHandler () {
 	  #allowErrorStatusCodes
 
 	  /**
-	   * @param {(boolean) => void} callback Function to call if the cached value is valid
+	   * @param {(success: boolean, context?: any, statusCode?: number, headers?: import('../../types/header.d.ts').IncomingHttpHeaders) => void} callback Function to call if the cached value is valid
 	   * @param {import('../../types/dispatcher.d.ts').default.DispatchHandlers} handler
 	   * @param {boolean} allowErrorStatusCodes
 	   */
@@ -22272,7 +24233,7 @@ function requireCacheRevalidationHandler () {
 	    // https://datatracker.ietf.org/doc/html/rfc5861#section-4
 	    this.#successful = statusCode === 304 ||
 	      (this.#allowErrorStatusCodes && statusCode >= 500 && statusCode <= 504);
-	    this.#callback(this.#successful, this.#context);
+	    this.#callback(this.#successful, this.#context, statusCode, headers);
 	    this.#callback = null;
 
 	    if (this.#successful) {
@@ -22333,14 +24294,15 @@ function requireCache$1 () {
 	if (hasRequiredCache$1) return cache$1;
 	hasRequiredCache$1 = 1;
 
-	const assert = require$$0;
-	const { Readable } = require$$0$1;
+	const assert = require$$0$1;
+	const { Readable } = require$$0$2;
 	const util = requireUtil$5();
 	const CacheHandler = requireCacheHandler();
 	const MemoryCacheStore = requireMemoryCacheStore();
 	const CacheRevalidationHandler = requireCacheRevalidationHandler();
-	const { assertCacheStore, assertCacheMethods, makeCacheKey, normalizeHeaders, parseCacheControlHeader } = requireCache$2();
+	const { assertCacheStore, assertCacheMethods, makeCacheKey, normalizeHeaders, parseCacheControlHeader, isInvalidOrWildcardVaryHeader } = requireCache$2();
 	const { AbortError } = requireErrors();
+	const { parseHttpDate } = requireDate();
 
 	/**
 	 * @param {(string | RegExp)[] | undefined} origins
@@ -22360,6 +24322,44 @@ function requireCache$1 () {
 	}
 
 	const nop = () => {};
+
+	function trimOWS (value) {
+	  return value.replace(/^[\t ]+|[\t ]+$/g, '')
+	}
+
+	function arrayIncludes (array, value) {
+	  for (let i = 0; i < array.length; i++) {
+	    if (array[i] === value) {
+	      return true
+	    }
+	  }
+
+	  return false
+	}
+
+	function hasPragmaNoCache (headers) {
+	  const pragma = headers?.pragma;
+	  if (!pragma) {
+	    return false
+	  }
+
+	  const values = Array.isArray(pragma) ? pragma : [pragma];
+	  for (let i = 0; i < values.length; i++) {
+	    const value = values[i];
+	    if (typeof value !== 'string') {
+	      continue
+	    }
+
+	    const directives = value.split(',');
+	    for (let j = 0; j < directives.length; j++) {
+	      if (trimOWS(directives[j]).toLowerCase() === 'no-cache') {
+	        return true
+	      }
+	    }
+	  }
+
+	  return false
+	}
 
 	/**
 	 * @typedef {(options: import('../../types/dispatcher.d.ts').default.DispatchOptions, handler: import('../../types/dispatcher.d.ts').default.DispatchHandler) => void} DispatchFn
@@ -22392,14 +24392,90 @@ function requireCache$1 () {
 
 	/**
 	 * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
-	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives | undefined} cacheControlDirectives
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
 	 * @returns {boolean}
 	 */
-	function isStale (result, cacheControlDirectives) {
+	function staleResponseRequiresRevalidation (result, cacheType) {
+	  return result.cacheControlDirectives?.['must-revalidate'] === true ||
+	    (cacheType === 'shared' && (
+	      result.cacheControlDirectives?.['proxy-revalidate'] === true ||
+	      // https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.10
+	      // s-maxage implies proxy-revalidate for shared caches.
+	      result.cacheControlDirectives?.['s-maxage'] !== undefined
+	    ))
+	}
+
+	/**
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders} headers
+	 * @returns {boolean}
+	 */
+	function revalidationResponseDisallowsCachedReuse (cacheType, headers) {
+	  if (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary)) {
+	    return true
+	  }
+
+	  const cacheControl = headers['cache-control'];
+	  if (!cacheControl) {
+	    return false
+	  }
+
+	  const cacheControlDirectives = parseCacheControlHeader(cacheControl);
+	  return cacheControlDirectives['no-store'] === true ||
+	    (cacheType === 'shared' && cacheControlDirectives.private === true)
+	}
+
+	function revalidationResponseUpdatesCacheControl (headers) {
+	  return headers['cache-control'] !== undefined
+	}
+
+	function deleteCachedValue (store, cacheKey) {
+	  try {
+	    store.delete(cacheKey)?.catch?.(nop);
+	  } catch {
+	    // Fail silently
+	  }
+	}
+
+	function getUsableLastModified (headers) {
+	  const lastModified = headers?.['last-modified'];
+	  if (typeof lastModified === 'string' && parseHttpDate(lastModified)) {
+	    return lastModified
+	  }
+	}
+
+	function makeRevalidationHeaders (opts, result) {
+	  const headers = {
+	    ...opts.headers,
+	    'if-modified-since': getUsableLastModified(result.headers) ?? new Date(result.cachedAt).toUTCString()
+	  };
+
+	  if (result.etag) {
+	    headers['if-none-match'] = result.etag;
+	  }
+
+	  if (result.vary) {
+	    for (const key in result.vary) {
+	      if (result.vary[key] != null) {
+	        headers[key] = result.vary[key];
+	      }
+	    }
+	  }
+
+	  return headers
+	}
+
+	/**
+	 * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives | undefined} cacheControlDirectives
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+	 * @returns {boolean}
+	 */
+	function isStale (result, cacheControlDirectives, cacheType) {
 	  const now = Date.now();
 	  if (now > result.staleAt) {
 	    // Response is stale
-	    if (cacheControlDirectives?.['max-stale']) {
+	    if (!staleResponseRequiresRevalidation(result, cacheType) && cacheControlDirectives?.['max-stale']) {
 	      // There's a threshold where we can serve stale responses, let's see if
 	      //  we're in it
 	      // https://www.rfc-editor.org/rfc/rfc9111.html#name-max-stale
@@ -22426,11 +24502,12 @@ function requireCache$1 () {
 	/**
 	 * Check if we're within the stale-while-revalidate window for a stale response
 	 * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
 	 * @returns {boolean}
 	 */
-	function withinStaleWhileRevalidateWindow (result) {
+	function withinStaleWhileRevalidateWindow (result, cacheType) {
 	  const staleWhileRevalidate = result.cacheControlDirectives?.['stale-while-revalidate'];
-	  if (!staleWhileRevalidate) {
+	  if (!staleWhileRevalidate || staleResponseRequiresRevalidation(result, cacheType)) {
 	    return false
 	  }
 
@@ -22600,14 +24677,10 @@ function requireCache$1 () {
 	  }
 
 	  const age = Math.round((now - result.cachedAt) / 1000);
-	  if (reqCacheControl?.['max-age'] && age >= reqCacheControl['max-age']) {
-	    // Response is considered expired for this specific request
-	    //  https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.1.1
-	    return dispatch(opts, handler)
-	  }
+	  const requestMaxAgeExpired = reqCacheControl?.['max-age'] !== undefined && age >= reqCacheControl['max-age'];
 
-	  const stale = isStale(result, reqCacheControl);
-	  const revalidate = needsRevalidation(result, reqCacheControl, opts);
+	  const stale = requestMaxAgeExpired || isStale(result, reqCacheControl, globalOpts.type);
+	  const revalidate = requestMaxAgeExpired || needsRevalidation(result, reqCacheControl, opts);
 
 	  // Check if the response is stale
 	  if (stale || revalidate) {
@@ -22619,28 +24692,13 @@ function requireCache$1 () {
 
 	    // RFC 5861: If we're within stale-while-revalidate window, serve stale immediately
 	    // and revalidate in background, unless immediate revalidation is necessary
-	    if (!revalidate && withinStaleWhileRevalidateWindow(result)) {
+	    if (!revalidate && withinStaleWhileRevalidateWindow(result, globalOpts.type)) {
 	      // Serve stale response immediately
 	      sendCachedValue(handler, opts, result, age, null, true);
 
 	      // Start background revalidation (fire-and-forget)
 	      queueMicrotask(() => {
-	        const headers = {
-	          ...opts.headers,
-	          'if-modified-since': new Date(result.cachedAt).toUTCString()
-	        };
-
-	        if (result.etag) {
-	          headers['if-none-match'] = result.etag;
-	        }
-
-	        if (result.vary) {
-	          for (const key in result.vary) {
-	            if (result.vary[key] != null) {
-	              headers[key] = result.vary[key];
-	            }
-	          }
-	        }
+	        const headers = makeRevalidationHeaders(opts, result);
 
 	        // Background revalidation - update cache if we get new data
 	        dispatch(
@@ -22664,27 +24722,14 @@ function requireCache$1 () {
 	    }
 
 	    let withinStaleIfErrorThreshold = false;
-	    const staleIfErrorExpiry = result.cacheControlDirectives['stale-if-error'] ?? reqCacheControl?.['stale-if-error'];
-	    if (staleIfErrorExpiry) {
-	      withinStaleIfErrorThreshold = now < (result.staleAt + (staleIfErrorExpiry * 1000));
-	    }
-
-	    const headers = {
-	      ...opts.headers,
-	      'if-modified-since': new Date(result.cachedAt).toUTCString()
-	    };
-
-	    if (result.etag) {
-	      headers['if-none-match'] = result.etag;
-	    }
-
-	    if (result.vary) {
-	      for (const key in result.vary) {
-	        if (result.vary[key] != null) {
-	          headers[key] = result.vary[key];
-	        }
+	    if (!staleResponseRequiresRevalidation(result, globalOpts.type)) {
+	      const staleIfErrorExpiry = result.cacheControlDirectives['stale-if-error'] ?? reqCacheControl?.['stale-if-error'];
+	      if (staleIfErrorExpiry) {
+	        withinStaleIfErrorThreshold = now < (result.staleAt + (staleIfErrorExpiry * 1000));
 	      }
 	    }
+
+	    const headers = makeRevalidationHeaders(opts, result);
 
 	    // We need to revalidate the response
 	    return dispatch(
@@ -22693,8 +24738,23 @@ function requireCache$1 () {
 	        headers
 	      },
 	      new CacheRevalidationHandler(
-	        (success, context) => {
+	        (success, context, statusCode, headers) => {
 	          if (success) {
+	            if (statusCode === 304) {
+	              if (revalidationResponseDisallowsCachedReuse(globalOpts.type, headers)) {
+	                if (util.isStream(result.body)) {
+	                  result.body.on('error', nop).destroy();
+	                }
+
+	                deleteCachedValue(globalOpts.store, cacheKey);
+	                return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
+	              }
+
+	              if (revalidationResponseUpdatesCacheControl(headers)) {
+	                deleteCachedValue(globalOpts.store, cacheKey);
+	              }
+	            }
+
 	            // TODO: successful revalidation should be considered fresh (not give stale warning).
 	            sendCachedValue(handler, opts, result, age, context, stale);
 	          } else if (util.isStream(result.body)) {
@@ -22751,11 +24811,17 @@ function requireCache$1 () {
 	    type
 	  };
 
-	  const safeMethodsToNotCache = util.safeHTTPMethods.filter(method => methods.includes(method) === false);
+	  const safeMethodsToNotCache = [];
+	  for (let i = 0; i < util.safeHTTPMethods.length; i++) {
+	    const method = util.safeHTTPMethods[i];
+	    if (!arrayIncludes(methods, method)) {
+	      safeMethodsToNotCache.push(method);
+	    }
+	  }
 
 	  return dispatch => {
 	    return (opts, handler) => {
-	      if (!opts.origin || safeMethodsToNotCache.includes(opts.method)) {
+	      if (!opts.origin || arrayIncludes(safeMethodsToNotCache, opts.method)) {
 	        // Not a method we want to cache or we don't have the origin, skip
 	        return dispatch(opts, handler)
 	      }
@@ -22790,7 +24856,9 @@ function requireCache$1 () {
 
 	      const reqCacheControl = opts.headers?.['cache-control']
 	        ? parseCacheControlHeader(opts.headers['cache-control'])
-	        : undefined;
+	        : hasPragmaNoCache(opts.headers)
+	          ? { 'no-cache': true }
+	          : undefined;
 
 	      if (reqCacheControl?.['no-store']) {
 	        return dispatch(opts, handler)
@@ -22837,7 +24905,7 @@ function requireDecompress () {
 	hasRequiredDecompress = 1;
 
 	const { createInflate, createGunzip, createBrotliDecompress, createZstdDecompress } = require$$3$1;
-	const { pipeline } = require$$0$1;
+	const { pipeline } = require$$0$2;
 	const DecoratorHandler = requireDecoratorHandler();
 	const { runtimeFeatures } = requireRuntimeFeatures();
 
@@ -23103,12 +25171,26 @@ function requireDeduplicationHandler () {
 	if (hasRequiredDeduplicationHandler) return deduplicationHandler;
 	hasRequiredDeduplicationHandler = 1;
 
+	const { RequestAbortedError } = requireErrors();
+
 	/**
 	 * @typedef {import('../../types/dispatcher.d.ts').default.DispatchHandler} DispatchHandler
 	 */
 
+	const DEFAULT_MAX_BUFFER_SIZE = 5 * 1024 * 1024;
+
 	/**
-	 * Handler that buffers response data and notifies multiple waiting handlers.
+	 * @typedef {Object} WaitingHandler
+	 * @property {DispatchHandler} handler
+	 * @property {import('../../types/dispatcher.d.ts').default.DispatchController} controller
+	 * @property {Buffer[]} bufferedChunks
+	 * @property {number} bufferedBytes
+	 * @property {object | null} pendingTrailers
+	 * @property {boolean} done
+	 */
+
+	/**
+	 * Handler that forwards response events to multiple waiting handlers.
 	 * Used for request deduplication.
 	 *
 	 * @implements {DispatchHandler}
@@ -23120,14 +25202,14 @@ function requireDeduplicationHandler () {
 	  #primaryHandler
 
 	  /**
-	   * @type {DispatchHandler[]}
+	   * @type {WaitingHandler[]}
 	   */
 	  #waitingHandlers = []
 
 	  /**
-	   * @type {Buffer[]}
+	   * @type {number}
 	   */
-	  #chunks = []
+	  #maxBufferSize = DEFAULT_MAX_BUFFER_SIZE
 
 	  /**
 	   * @type {number}
@@ -23150,6 +25232,21 @@ function requireDeduplicationHandler () {
 	  #aborted = false
 
 	  /**
+	   * @type {boolean}
+	   */
+	  #responseStarted = false
+
+	  /**
+	   * @type {boolean}
+	   */
+	  #responseDataStarted = false
+
+	  /**
+	   * @type {boolean}
+	   */
+	  #completed = false
+
+	  /**
 	   * @type {import('../../types/dispatcher.d.ts').default.DispatchController | null}
 	   */
 	  #controller = null
@@ -23162,22 +25259,60 @@ function requireDeduplicationHandler () {
 	  /**
 	   * @param {DispatchHandler} primaryHandler The primary handler
 	   * @param {() => void} onComplete Callback when request completes
+	   * @param {number} [maxBufferSize] Maximum paused buffer size per waiting handler
 	   */
-	  constructor (primaryHandler, onComplete) {
+	  constructor (primaryHandler, onComplete, maxBufferSize = DEFAULT_MAX_BUFFER_SIZE) {
 	    this.#primaryHandler = primaryHandler;
 	    this.#onComplete = onComplete;
+	    this.#maxBufferSize = maxBufferSize;
 	  }
 
 	  /**
-	   * Add a waiting handler that will receive the buffered response
+	   * Add a waiting handler that will receive response events.
+	   * Returns false if deduplication can no longer safely attach this handler.
+	   *
 	   * @param {DispatchHandler} handler
+	   * @returns {boolean}
 	   */
 	  addWaitingHandler (handler) {
-	    this.#waitingHandlers.push(handler);
+	    if (this.#completed || this.#responseDataStarted) {
+	      return false
+	    }
+
+	    const waitingHandler = this.#createWaitingHandler(handler);
+	    const waitingController = waitingHandler.controller;
+
+	    try {
+	      handler.onRequestStart?.(waitingController, null);
+
+	      if (waitingController.aborted) {
+	        waitingHandler.done = true;
+	        return true
+	      }
+
+	      if (this.#responseStarted) {
+	        handler.onResponseStart?.(
+	          waitingController,
+	          this.#statusCode,
+	          this.#headers,
+	          this.#statusMessage
+	        );
+	      }
+	    } catch {
+	      // Ignore errors from waiting handlers
+	      waitingHandler.done = true;
+	      return true
+	    }
+
+	    if (!waitingController.aborted) {
+	      this.#waitingHandlers.push(waitingHandler);
+	    }
+
+	    return true
 	  }
 
 	  /**
-	   * @param {() => void} abort
+	   * @param {import('../../types/dispatcher.d.ts').default.DispatchController} controller
 	   * @param {any} context
 	   */
 	  onRequestStart (controller, context) {
@@ -23202,10 +25337,38 @@ function requireDeduplicationHandler () {
 	   * @param {string} statusMessage
 	   */
 	  onResponseStart (controller, statusCode, headers, statusMessage) {
+	    this.#responseStarted = true;
 	    this.#statusCode = statusCode;
 	    this.#headers = headers;
 	    this.#statusMessage = statusMessage;
+
 	    this.#primaryHandler.onResponseStart?.(controller, statusCode, headers, statusMessage);
+
+	    for (const waitingHandler of this.#waitingHandlers) {
+	      const { handler, controller: waitingController } = waitingHandler;
+
+	      if (waitingHandler.done || waitingController.aborted) {
+	        waitingHandler.done = true;
+	        continue
+	      }
+
+	      try {
+	        handler.onResponseStart?.(
+	          waitingController,
+	          statusCode,
+	          headers,
+	          statusMessage
+	        );
+	      } catch {
+	        // Ignore errors from waiting handlers
+	      }
+
+	      if (waitingController.aborted) {
+	        waitingHandler.done = true;
+	      }
+	    }
+
+	    this.#pruneDoneWaitingHandlers();
 	  }
 
 	  /**
@@ -23213,9 +25376,41 @@ function requireDeduplicationHandler () {
 	   * @param {Buffer} chunk
 	   */
 	  onResponseData (controller, chunk) {
-	    // Buffer the chunk for waiting handlers
-	    this.#chunks.push(Buffer.from(chunk));
+	    if (this.#aborted || this.#completed) {
+	      return
+	    }
+
+	    this.#responseDataStarted = true;
+
 	    this.#primaryHandler.onResponseData?.(controller, chunk);
+
+	    for (const waitingHandler of this.#waitingHandlers) {
+	      const { handler, controller: waitingController } = waitingHandler;
+
+	      if (waitingHandler.done || waitingController.aborted) {
+	        waitingHandler.done = true;
+	        continue
+	      }
+
+	      if (waitingController.paused) {
+	        this.#bufferWaitingChunk(waitingHandler, chunk);
+	        continue
+	      }
+
+	      try {
+	        handler.onResponseData?.(waitingController, chunk);
+	      } catch {
+	        // Ignore errors from waiting handlers
+	      }
+
+	      if (waitingController.aborted) {
+	        waitingHandler.done = true;
+	        waitingHandler.bufferedChunks = [];
+	        waitingHandler.bufferedBytes = 0;
+	      }
+	    }
+
+	    this.#pruneDoneWaitingHandlers();
 	  }
 
 	  /**
@@ -23223,8 +25418,41 @@ function requireDeduplicationHandler () {
 	   * @param {object} trailers
 	   */
 	  onResponseEnd (controller, trailers) {
+	    if (this.#aborted || this.#completed) {
+	      return
+	    }
+
+	    this.#completed = true;
 	    this.#primaryHandler.onResponseEnd?.(controller, trailers);
-	    this.#notifyWaitingHandlers();
+
+	    for (const waitingHandler of this.#waitingHandlers) {
+	      if (waitingHandler.done || waitingHandler.controller.aborted) {
+	        waitingHandler.done = true;
+	        continue
+	      }
+
+	      this.#flushWaitingHandler(waitingHandler);
+
+	      if (waitingHandler.done || waitingHandler.controller.aborted) {
+	        waitingHandler.done = true;
+	        continue
+	      }
+
+	      if (waitingHandler.controller.paused && waitingHandler.bufferedChunks.length > 0) {
+	        waitingHandler.pendingTrailers = trailers;
+	        continue
+	      }
+
+	      try {
+	        waitingHandler.handler.onResponseEnd?.(waitingHandler.controller, trailers);
+	      } catch {
+	        // Ignore errors from waiting handlers
+	      }
+
+	      waitingHandler.done = true;
+	    }
+
+	    this.#pruneDoneWaitingHandlers();
 	    this.#onComplete?.();
 	  }
 
@@ -23233,86 +25461,170 @@ function requireDeduplicationHandler () {
 	   * @param {Error} err
 	   */
 	  onResponseError (controller, err) {
+	    if (this.#completed) {
+	      return
+	    }
+
 	    this.#aborted = true;
+	    this.#completed = true;
+
 	    this.#primaryHandler.onResponseError?.(controller, err);
-	    this.#notifyWaitingHandlersError(err);
+
+	    for (const waitingHandler of this.#waitingHandlers) {
+	      this.#errorWaitingHandler(waitingHandler, err);
+	    }
+
+	    this.#waitingHandlers = [];
 	    this.#onComplete?.();
 	  }
 
 	  /**
-	   * Notify all waiting handlers with the buffered response
+	   * @param {DispatchHandler} handler
+	   * @returns {WaitingHandler}
 	   */
-	  #notifyWaitingHandlers () {
-	    const body = Buffer.concat(this.#chunks);
+	  #createWaitingHandler (handler) {
+	    /** @type {WaitingHandler} */
+	    const waitingHandler = {
+	      handler,
+	      controller: null,
+	      bufferedChunks: [],
+	      bufferedBytes: 0,
+	      pendingTrailers: null,
+	      done: false
+	    };
 
-	    for (const handler of this.#waitingHandlers) {
-	      // Create a simple controller for each waiting handler
-	      const waitingController = {
-	        resume () {},
-	        pause () {},
-	        get paused () { return false },
-	        get aborted () { return false },
-	        get reason () { return null },
-	        abort () {}
-	      };
+	    const state = {
+	      aborted: false,
+	      paused: false,
+	      reason: null
+	    };
 
-	      try {
-	        handler.onRequestStart?.(waitingController, null);
-
-	        if (waitingController.aborted) {
-	          continue
+	    waitingHandler.controller = {
+	      resume: () => {
+	        if (state.aborted) {
+	          return
 	        }
 
-	        handler.onResponseStart?.(
-	          waitingController,
-	          this.#statusCode,
-	          this.#headers,
-	          this.#statusMessage
-	        );
+	        state.paused = false;
+	        this.#flushWaitingHandler(waitingHandler);
 
-	        if (waitingController.aborted) {
-	          continue
+	        if (
+	          this.#completed &&
+	          waitingHandler.pendingTrailers &&
+	          waitingHandler.bufferedChunks.length === 0 &&
+	          !state.paused &&
+	          !state.aborted
+	        ) {
+	          try {
+	            waitingHandler.handler.onResponseEnd?.(waitingHandler.controller, waitingHandler.pendingTrailers);
+	          } catch {
+	            // Ignore errors from waiting handlers
+	          }
+
+	          waitingHandler.pendingTrailers = null;
+	          waitingHandler.done = true;
 	        }
 
-	        if (body.length > 0) {
-	          handler.onResponseData?.(waitingController, body);
+	        this.#pruneDoneWaitingHandlers();
+	      },
+	      pause: () => {
+	        if (!state.aborted) {
+	          state.paused = true;
 	        }
-
-	        handler.onResponseEnd?.(waitingController, {});
-	      } catch {
-	        // Ignore errors from waiting handlers
+	      },
+	      get paused () { return state.paused },
+	      get aborted () { return state.aborted },
+	      get reason () { return state.reason },
+	      abort: (reason) => {
+	        state.aborted = true;
+	        state.reason = reason ?? null;
+	        waitingHandler.done = true;
+	        waitingHandler.pendingTrailers = null;
+	        waitingHandler.bufferedChunks = [];
+	        waitingHandler.bufferedBytes = 0;
 	      }
-	    }
+	    };
 
-	    this.#waitingHandlers = [];
-	    this.#chunks = [];
+	    return waitingHandler
 	  }
 
 	  /**
-	   * Notify all waiting handlers of an error
-	   * @param {Error} err
+	   * @param {WaitingHandler} waitingHandler
+	   * @param {Buffer} chunk
 	   */
-	  #notifyWaitingHandlersError (err) {
-	    for (const handler of this.#waitingHandlers) {
-	      const waitingController = {
-	        resume () {},
-	        pause () {},
-	        get paused () { return false },
-	        get aborted () { return true },
-	        get reason () { return err },
-	        abort () {}
-	      };
+	  #bufferWaitingChunk (waitingHandler, chunk) {
+	    if (waitingHandler.done || waitingHandler.controller.aborted) {
+	      waitingHandler.done = true;
+	      waitingHandler.bufferedChunks = [];
+	      waitingHandler.bufferedBytes = 0;
+	      return
+	    }
+
+	    const bufferedChunk = Buffer.from(chunk);
+	    waitingHandler.bufferedChunks.push(bufferedChunk);
+	    waitingHandler.bufferedBytes += bufferedChunk.length;
+
+	    if (waitingHandler.bufferedBytes > this.#maxBufferSize) {
+	      const err = new RequestAbortedError(`Deduplicated waiting handler exceeded maxBufferSize (${this.#maxBufferSize} bytes) while paused`);
+	      this.#errorWaitingHandler(waitingHandler, err);
+	    }
+	  }
+
+	  /**
+	   * @param {WaitingHandler} waitingHandler
+	   */
+	  #flushWaitingHandler (waitingHandler) {
+	    const { handler, controller } = waitingHandler;
+
+	    while (
+	      !waitingHandler.done &&
+	      !controller.aborted &&
+	      !controller.paused &&
+	      waitingHandler.bufferedChunks.length > 0
+	    ) {
+	      const bufferedChunk = waitingHandler.bufferedChunks.shift();
+	      waitingHandler.bufferedBytes -= bufferedChunk.length;
 
 	      try {
-	        handler.onRequestStart?.(waitingController, null);
-	        handler.onResponseError?.(waitingController, err);
+	        handler.onResponseData?.(controller, bufferedChunk);
 	      } catch {
 	        // Ignore errors from waiting handlers
 	      }
+
+	      if (controller.aborted) {
+	        waitingHandler.done = true;
+	        waitingHandler.pendingTrailers = null;
+	        waitingHandler.bufferedChunks = [];
+	        waitingHandler.bufferedBytes = 0;
+	        break
+	      }
+	    }
+	  }
+
+	  /**
+	   * @param {WaitingHandler} waitingHandler
+	   * @param {Error} err
+	   */
+	  #errorWaitingHandler (waitingHandler, err) {
+	    if (waitingHandler.done) {
+	      return
 	    }
 
-	    this.#waitingHandlers = [];
-	    this.#chunks = [];
+	    waitingHandler.done = true;
+	    waitingHandler.pendingTrailers = null;
+	    waitingHandler.bufferedChunks = [];
+	    waitingHandler.bufferedBytes = 0;
+
+	    try {
+	      waitingHandler.controller.abort(err);
+	      waitingHandler.handler.onResponseError?.(waitingHandler.controller, err);
+	    } catch {
+	      // Ignore errors from waiting handlers
+	    }
+	  }
+
+	  #pruneDoneWaitingHandlers () {
+	    this.#waitingHandlers = this.#waitingHandlers.filter(waitingHandler => waitingHandler.done === false);
 	  }
 	}
 
@@ -23342,7 +25654,8 @@ function requireDeduplicate () {
 	  const {
 	    methods = ['GET'],
 	    skipHeaderNames = [],
-	    excludeHeaderNames = []
+	    excludeHeaderNames = [],
+	    maxBufferSize = 5 * 1024 * 1024
 	  } = opts;
 
 	  if (typeof opts !== 'object' || opts === null) {
@@ -23365,6 +25678,10 @@ function requireDeduplicate () {
 
 	  if (!Array.isArray(excludeHeaderNames)) {
 	    throw new TypeError(`expected opts.excludeHeaderNames to be an array, got ${typeof excludeHeaderNames}`)
+	  }
+
+	  if (!Number.isFinite(maxBufferSize) || maxBufferSize <= 0) {
+	    throw new TypeError(`expected opts.maxBufferSize to be a positive finite number, got ${maxBufferSize}`)
 	  }
 
 	  // Convert to lowercase Set for case-insensitive header matching
@@ -23405,9 +25722,13 @@ function requireDeduplicate () {
 	      // Check if there's already a pending request for this key
 	      const pendingHandler = pendingRequests.get(dedupeKey);
 	      if (pendingHandler) {
-	        // Add this handler to the waiting list
-	        pendingHandler.addWaitingHandler(handler);
-	        return true
+	        // Add this handler to the waiting list when safe.
+	        // If body streaming has already started, this request must be sent independently.
+	        if (pendingHandler.addWaitingHandler(handler)) {
+	          return true
+	        }
+
+	        return dispatch(opts, handler)
 	      }
 
 	      // Create a new deduplication handler
@@ -23419,7 +25740,8 @@ function requireDeduplicate () {
 	          if (pendingRequestsChannel.hasSubscribers) {
 	            pendingRequestsChannel.publish({ size: pendingRequests.size, key: dedupeKey, type: 'removed' });
 	          }
-	        }
+	        },
+	        maxBufferSize
 	      );
 
 	      // Register the pending request
@@ -23442,7 +25764,7 @@ function requireSqliteCacheStore () {
 	if (hasRequiredSqliteCacheStore) return sqliteCacheStore;
 	hasRequiredSqliteCacheStore = 1;
 
-	const { Writable } = require$$0$1;
+	const { Writable } = require$$0$2;
 	const { assertCacheKey, assertCacheValue } = requireCache$2();
 
 	let DatabaseSync;
@@ -23552,7 +25874,7 @@ function requireSqliteCacheStore () {
 	    }
 
 	    if (!DatabaseSync) {
-	      DatabaseSync = require$$1$1.DatabaseSync;
+	      DatabaseSync = require$$1$2.DatabaseSync;
 	    }
 	    this.#db = new DatabaseSync(opts?.location ?? ':memory:');
 
@@ -23658,7 +25980,7 @@ function requireSqliteCacheStore () {
           SELECT
             id
           FROM cacheInterceptorV${VERSION}
-          ORDER BY cachedAt DESC
+          ORDER BY cachedAt ASC
           LIMIT ?
         )
       `);
@@ -23725,7 +26047,6 @@ function requireSqliteCacheStore () {
 	        existingValue.id
 	      );
 	    } else {
-	      this.#prune();
 	      // New response, let's insert it
 	      this.#insertValueQuery.run(
 	        url,
@@ -23741,6 +26062,7 @@ function requireSqliteCacheStore () {
 	        value.cachedAt,
 	        value.staleAt
 	      );
+	      this.#prune();
 	    }
 	  }
 
@@ -23851,7 +26173,7 @@ function requireSqliteCacheStore () {
 	    const now = Date.now();
 	    for (const value of values) {
 	      if (now >= value.deleteAt && !canBeExpired) {
-	        return undefined
+	        continue
 	      }
 
 	      let matches = true;
@@ -23896,7 +26218,13 @@ function requireSqliteCacheStore () {
 	      return false
 	    }
 
-	    return lhs.every((x, i) => x === rhs[i])
+	    for (let i = 0; i < lhs.length; i++) {
+	      if (lhs[i] !== rhs[i]) {
+	        return false
+	      }
+	    }
+
+	    return true
 	  }
 
 	  return lhs === rhs
@@ -23919,7 +26247,7 @@ function requireHeaders () {
 	  isValidHeaderValue
 	} = requireUtil$4();
 	const { webidl } = requireWebidl();
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const util = require$$3;
 
 	/**
@@ -24655,7 +26983,7 @@ function requireResponse () {
 	const { webidl } = requireWebidl();
 	const { URLSerializer } = requireDataUrl();
 	const { kConstruct } = requireSymbols();
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { isomorphicEncode, serializeJavascriptValueToJSONString } = requireInfra();
 
 	const textEncoder = new TextEncoder('utf-8');
@@ -25310,8 +27638,8 @@ function requireRequest () {
 	const { webidl } = requireWebidl();
 	const { URLSerializer } = requireDataUrl();
 	const { kConstruct } = requireSymbols();
-	const assert = require$$0;
-	const { getMaxListeners, setMaxListeners, defaultMaxListeners } = require$$6$1;
+	const assert = require$$0$1;
+	const { getMaxListeners, setMaxListeners, defaultMaxListeners } = require$$0;
 
 	const kAbortController = Symbol('abortController');
 
@@ -26408,7 +28736,7 @@ function requireSubresourceIntegrity () {
 	if (hasRequiredSubresourceIntegrity) return subresourceIntegrity;
 	hasRequiredSubresourceIntegrity = 1;
 
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { runtimeFeatures } = requireRuntimeFeatures();
 
 	/**
@@ -26768,7 +29096,7 @@ function requireFetch () {
 	  includesCredentials,
 	  isTraversableNavigable
 	} = requireUtil$4();
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { safelyExtractBody, extractBody } = requireBody();
 	const {
 	  redirectStatusSet,
@@ -26777,8 +29105,8 @@ function requireFetch () {
 	  requestBodyHeader,
 	  subresourceSet
 	} = requireConstants$2();
-	const EE = require$$6$1;
-	const { Readable, pipeline, finished, isErrored, isReadable } = require$$0$1;
+	const EE = require$$0;
+	const { Readable, pipeline, finished, isErrored, isReadable } = require$$0$2;
 	const { addAbortListener, bufferToLowerCasedHeaderName } = requireUtil$5();
 	const { dataURLProcessor, serializeAMimeType, minimizeSupportedMimeType } = requireDataUrl();
 	const { getGlobalDispatcher } = requireGlobal();
@@ -26972,7 +29300,10 @@ function requireFetch () {
 	    request,
 	    processResponseEndOfBody: handleFetchDone,
 	    processResponse,
-	    dispatcher: getRequestDispatcher(requestObject) // undici
+	    dispatcher: getRequestDispatcher(requestObject), // undici
+	    // Keep requestObject alive to prevent its AbortController from being GC'd
+	    // See https://github.com/nodejs/undici/issues/4627
+	    requestObject
 	  });
 
 	  // 14. Return p.
@@ -27091,7 +29422,8 @@ function requireFetch () {
 	  processResponseEndOfBody,
 	  processResponseConsumeBody,
 	  useParallelQueue = false,
-	  dispatcher = getGlobalDispatcher() // undici
+	  dispatcher = getGlobalDispatcher(), // undici
+	  requestObject = null // Keep alive to prevent AbortController GC, see #4627
 	}) {
 	  // Ensure that the dispatcher is set accordingly
 	  assert(dispatcher);
@@ -27145,7 +29477,9 @@ function requireFetch () {
 	    processResponseConsumeBody,
 	    processResponseEndOfBody,
 	    taskDestination,
-	    crossOriginIsolatedCapability
+	    crossOriginIsolatedCapability,
+	    // Keep requestObject alive to prevent its AbortController from being GC'd
+	    requestObject
 	  };
 
 	  // 7. If request’s body is a byte sequence, then set request’s body to
@@ -27741,7 +30075,7 @@ function requireFetch () {
 	      let responseStatus = 0;
 
 	      // 7. If fetchParams’s request’s mode is not "navigate" or response’s has-cross-origin-redirects is false:
-	      if (fetchParams.request.mode !== 'navigator' || !response.hasCrossOriginRedirects) {
+	      if (fetchParams.request.mode !== 'navigate' || !response.hasCrossOriginRedirects) {
 	        // 1. Set responseStatus to response’s status.
 	        responseStatus = response.status;
 
@@ -28133,7 +30467,10 @@ function requireFetch () {
 	  //    8. If contentLengthHeaderValue is non-null, then append
 	  //    `Content-Length`/contentLengthHeaderValue to httpRequest’s header
 	  //    list.
-	  if (contentLengthHeaderValue != null) {
+	  if (
+	    contentLengthHeaderValue != null &&
+	    !httpRequest.headersList.contains('content-length', true)
+	  ) {
 	    httpRequest.headersList.append('content-length', contentLengthHeaderValue, true);
 	  }
 
@@ -28330,12 +30667,25 @@ function requireFetch () {
 	  // 14. If response’s status is 401, httpRequest’s response tainting is not "cors",
 	  //     includeCredentials is true, and request’s traversable for user prompts is
 	  //     a traversable navigable:
-	  if (response.status === 401 && httpRequest.responseTainting !== 'cors' && includeCredentials && isTraversableNavigable(request.traversableForUserPrompts)) {
+	  //
+	  //     In Node.js there is no traversable navigable to prompt the user, but we
+	  //     still need to handle URL-embedded credentials so authentication retries
+	  //     for WebSocket handshakes continue to work.
+	  if (response.status === 401 && httpRequest.responseTainting !== 'cors' && includeCredentials && (
+	    request.useURLCredentials !== undefined ||
+	    isTraversableNavigable(request.traversableForUserPrompts)
+	  )) {
 	    // 2. If request’s body is non-null, then:
 	    if (request.body != null) {
 	      // 1. If request’s body’s source is null, then return a network error.
 	      if (request.body.source == null) {
-	        return makeNetworkError('expected non-null body source')
+	        // Note: In Node.js, this code path should not be reached because
+	        // isTraversableNavigable() returns false for non-navigable contexts.
+	        // However, we handle it gracefully by returning the response instead of
+	        // a network error, as we won't actually retry the request.
+	        // This aligns with the Fetch spec discussion in whatwg/fetch#1132,
+	        // which allows implementations flexibility when credentials can't be obtained.
+	        return response
 	      }
 
 	      // 2. Set request’s body to the body of the result of safely extracting
@@ -28791,9 +31141,12 @@ function requireFetch () {
 	    /** @type {import('../../..').Agent} */
 	    const agent = fetchParams.controller.dispatcher;
 
+	    const path = url.pathname + url.search;
+	    const hasTrailingQuestionMark = url.search.length === 0 && url.href[url.href.length - url.hash.length - 1] === '?';
+
 	    return new Promise((resolve, reject) => agent.dispatch(
 	      {
-	        path: url.pathname + url.search,
+	        path: hasTrailingQuestionMark ? `${path}?` : path,
 	        origin: url.origin,
 	        method: request.method,
 	        body: agent.isMockActive ? request.body && (request.body.source || request.body.stream) : body,
@@ -28843,7 +31196,15 @@ function requireFetch () {
 	          const headersList = new HeadersList();
 
 	          for (let i = 0; i < rawHeaders.length; i += 2) {
-	            headersList.append(bufferToLowerCasedHeaderName(rawHeaders[i]), rawHeaders[i + 1].toString('latin1'), true);
+	            const nameStr = bufferToLowerCasedHeaderName(rawHeaders[i]);
+	            const value = rawHeaders[i + 1];
+	            if (Array.isArray(value) && !Buffer.isBuffer(rawHeaders[i + 1])) {
+	              for (const val of value) {
+	                headersList.append(nameStr, val.toString('latin1'), true);
+	              }
+	            } else {
+	              headersList.append(nameStr, value.toString('latin1'), true);
+	            }
 	          }
 	          const location = headersList.get('location', true);
 
@@ -29012,7 +31373,15 @@ function requireFetch () {
 	          const headersList = new HeadersList();
 
 	          for (let i = 0; i < rawHeaders.length; i += 2) {
-	            headersList.append(bufferToLowerCasedHeaderName(rawHeaders[i]), rawHeaders[i + 1].toString('latin1'), true);
+	            const nameStr = bufferToLowerCasedHeaderName(rawHeaders[i]);
+	            const value = rawHeaders[i + 1];
+	            if (Array.isArray(value) && !Buffer.isBuffer(rawHeaders[i + 1])) {
+	              for (const val of value) {
+	                headersList.append(nameStr, val.toString('latin1'), true);
+	              }
+	            } else {
+	              headersList.append(nameStr, value.toString('latin1'), true);
+	            }
 	          }
 
 	          resolve({
@@ -29045,7 +31414,7 @@ function requireUtil$3 () {
 	if (hasRequiredUtil$3) return util$3;
 	hasRequiredUtil$3 = 1;
 
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { URLSerializer } = requireDataUrl();
 	const { isValidHeaderName } = requireUtil$4();
 
@@ -29098,7 +31467,7 @@ function requireCache () {
 	if (hasRequiredCache) return cache;
 	hasRequiredCache = 1;
 
-	const assert = require$$0;
+	const assert = require$$0$1;
 
 	const { kConstruct } = requireSymbols();
 	const { urlEquals, getFieldValues } = requireUtil$3();
@@ -30255,7 +32624,7 @@ function requireUtil$2 () {
 
 	    if (
 	      code < 0x20 || // exclude CTLs (0-31)
-	      code === 0x7F || // DEL
+	      code > 0x7E || // exclude DEL and non-ascii
 	      code === 0x3B // ;
 	    ) {
 	      throw new Error('Invalid cookie path')
@@ -30264,16 +32633,80 @@ function requireUtil$2 () {
 	}
 
 	/**
-	 * I have no idea why these values aren't allowed to be honest,
-	 * but Deno tests these. - Khafra
+	 * <let-dig> ::= <letter> | <digit>
+	 *
+	 * <letter> ::= any one of the 52 alphabetic characters A through Z in
+	 * upper case and a through z in lower case
+	 *
+	 * <digit> ::= any one of the ten digits 0 through 9r
+	 *
+	 * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+	 * @param {number} code
+	 */
+	function isLetterOrDigit (code) {
+	  return (
+	    (code >= 0x30 && code <= 0x39) || // 0-9
+	    (code >= 0x41 && code <= 0x5A) || // A-Z
+	    (code >= 0x61 && code <= 0x7A) // a-z
+	  )
+	}
+
+	/**
+	 * Validates a cookie domain against the "preferred name syntax".
+	 *
+	 * <domain>      ::= <subdomain> | " "
+	 * <subdomain>   ::= <label> | <subdomain> "." <label>
+	 * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+	 * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+	 * <let-dig-hyp> ::= <let-dig> | "-"
+	 *
+	 * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+	 * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+	 * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
 	 * @param {string} domain
 	 */
 	function validateCookieDomain (domain) {
-	  if (
-	    domain.startsWith('-') ||
-	    domain.endsWith('.') ||
-	    domain.endsWith('-')
-	  ) {
+	  // <domain> ::= <subdomain> | " "
+	  if (domain === ' ') {
+	    return
+	  }
+
+	  if (domain.length > 255) {
+	    throw new Error('Invalid cookie domain')
+	  }
+
+	  let labelLength = 0;
+
+	  for (let i = 0; i < domain.length; ++i) {
+	    const code = domain.charCodeAt(i);
+
+	    if (code === 0x2E) {
+	      if (labelLength === 0) {
+	        throw new Error('Invalid cookie domain')
+	      }
+
+	      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+	        throw new Error('Invalid cookie domain')
+	      }
+
+	      labelLength = 0;
+	      continue
+	    }
+
+	    if (labelLength === 0 && !isLetterOrDigit(code)) {
+	      throw new Error('Invalid cookie domain')
+	    }
+
+	    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+	      throw new Error('Invalid cookie domain')
+	    }
+
+	    if (++labelLength > 63) {
+	      throw new Error('Invalid cookie domain')
+	    }
+	  }
+
+	  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
 	    throw new Error('Invalid cookie domain')
 	  }
 	}
@@ -30416,7 +32849,13 @@ function requireUtil$2 () {
 
 	    const [key, ...value] = part.split('=');
 
-	    out.push(`${key.trim()}=${value.join('=')}`);
+	    const trimmedKey = key.trim();
+	    const joinedValue = value.join('=');
+
+	    validateCookieName(trimmedKey);
+	    validateCookieValue(joinedValue);
+
+	    out.push(`${trimmedKey}=${joinedValue}`);
 	  }
 
 	  return out.join('; ')
@@ -30443,8 +32882,7 @@ function requireParse () {
 	const { collectASequenceOfCodePointsFast } = requireInfra();
 	const { maxNameValuePairSize, maxAttributeValueSize } = requireConstants$1();
 	const { isCTLExcludingHtab } = requireUtil$2();
-	const assert = require$$0;
-	const { unescape: qsUnescape } = require$$5;
+	const assert = require$$0$1;
 
 	/**
 	 * @description Parses the field-value attributes of a set-cookie header string.
@@ -30522,7 +32960,7 @@ function requireParse () {
 	  // store arbitrary data in a cookie-value SHOULD encode that data, for
 	  // example, using Base64 [RFC4648].
 	  return {
-	    name, value: qsUnescape(value), ...parseUnparsedAttributes(unparsedAttributes)
+	    name, value, ...parseUnparsedAttributes(unparsedAttributes)
 	  }
 	}
 
@@ -30720,32 +33158,25 @@ function requireParse () {
 	    // If the attribute-name case-insensitively matches the string
 	    // "SameSite", the user agent MUST process the cookie-av as follows:
 
-	    // 1. Let enforcement be "Default".
-	    let enforcement = 'Default';
-
 	    const attributeValueLowercase = attributeValue.toLowerCase();
-	    // 2. If cookie-av's attribute-value is a case-insensitive match for
-	    //    "None", set enforcement to "None".
-	    if (attributeValueLowercase.includes('none')) {
-	      enforcement = 'None';
-	    }
 
-	    // 3. If cookie-av's attribute-value is a case-insensitive match for
-	    //    "Strict", set enforcement to "Strict".
-	    if (attributeValueLowercase.includes('strict')) {
-	      enforcement = 'Strict';
+	    // 1. If cookie-av's attribute-value is a case-insensitive match for
+	    //    "None", append an attribute to the cookie-attribute-list with an
+	    //    attribute-name of "SameSite" and an attribute-value of "None".
+	    if (attributeValueLowercase === 'none') {
+	      cookieAttributeList.sameSite = 'None';
+	    } else if (attributeValueLowercase === 'strict') {
+	      // 2. If cookie-av's attribute-value is a case-insensitive match for
+	      //    "Strict", append an attribute to the cookie-attribute-list with
+	      //    an attribute-name of "SameSite" and an attribute-value of
+	      //    "Strict".
+	      cookieAttributeList.sameSite = 'Strict';
+	    } else if (attributeValueLowercase === 'lax') {
+	      // 3. If cookie-av's attribute-value is a case-insensitive match for
+	      //    "Lax", append an attribute to the cookie-attribute-list with an
+	      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+	      cookieAttributeList.sameSite = 'Lax';
 	    }
-
-	    // 4. If cookie-av's attribute-value is a case-insensitive match for
-	    //    "Lax", set enforcement to "Lax".
-	    if (attributeValueLowercase.includes('lax')) {
-	      enforcement = 'Lax';
-	    }
-
-	    // 5. Append an attribute to the cookie-attribute-list with an
-	    //    attribute-name of "SameSite" and an attribute-value of
-	    //    enforcement.
-	    cookieAttributeList.sameSite = enforcement;
 	  } else {
 	    cookieAttributeList.unparsed ??= [];
 
@@ -31677,6 +34108,12 @@ function requireUtil$1 () {
 	 * @returns {boolean}
 	 */
 	function isValidClientWindowBits (value) {
+	  // Must have at least one character
+	  if (value.length === 0) {
+	    return false
+	  }
+
+	  // Check all characters are ASCII digits
 	  for (let i = 0; i < value.length; i++) {
 	    const byte = value.charCodeAt(i);
 
@@ -31685,7 +34122,9 @@ function requireUtil$1 () {
 	    }
 	  }
 
-	  return true
+	  // Check numeric range: zlib requires windowBits in range 8-15
+	  const num = Number.parseInt(value, 10);
+	  return num >= 8 && num <= 15
 	}
 
 	/**
@@ -31945,7 +34384,7 @@ function requireConnection () {
 	const { Headers, getHeadersList } = requireHeaders();
 	const { getDecodeSplit } = requireUtil$4();
 	const { WebsocketFrameSend } = requireFrame();
-	const assert = require$$0;
+	const assert = require$$0$1;
 	const { runtimeFeatures } = requireRuntimeFeatures();
 
 	const crypto = runtimeFeatures.has('crypto')
@@ -32275,6 +34714,7 @@ function requirePermessageDeflate () {
 
 	const { createInflateRaw, Z_DEFAULT_WINDOWBITS } = require$$3$1;
 	const { isValidClientWindowBits } = requireUtil$1();
+	const { MessageSizeExceededError } = requireErrors();
 
 	const tail = Buffer.from([0x00, 0x00, 0xff, 0xff]);
 	const kBuffer = Symbol('kBuffer');
@@ -32286,17 +34726,29 @@ function requirePermessageDeflate () {
 
 	  #options = {}
 
-	  constructor (extensions) {
+	  #maxPayloadSize = 0
+
+	  /**
+	   * @param {Map<string, string>} extensions
+	   */
+	  constructor (extensions, options) {
 	    this.#options.serverNoContextTakeover = extensions.has('server_no_context_takeover');
 	    this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits');
+
+	    this.#maxPayloadSize = options.maxPayloadSize;
 	  }
 
+	  /**
+	   * Decompress a compressed payload.
+	   * @param {Buffer} chunk Compressed data
+	   * @param {boolean} fin Final fragment flag
+	   * @param {Function} callback Callback function
+	   */
 	  decompress (chunk, fin, callback) {
 	    // An endpoint uses the following algorithm to decompress a message.
 	    // 1.  Append 4 octets of 0x00 0x00 0xff 0xff to the tail end of the
 	    //     payload of the message.
 	    // 2.  Decompress the resulting data using DEFLATE.
-
 	    if (!this.#inflate) {
 	      let windowBits = Z_DEFAULT_WINDOWBITS;
 
@@ -32309,13 +34761,26 @@ function requirePermessageDeflate () {
 	        windowBits = Number.parseInt(this.#options.serverMaxWindowBits);
 	      }
 
-	      this.#inflate = createInflateRaw({ windowBits });
+	      try {
+	        this.#inflate = createInflateRaw({ windowBits });
+	      } catch (err) {
+	        callback(err);
+	        return
+	      }
 	      this.#inflate[kBuffer] = [];
 	      this.#inflate[kLength] = 0;
 
 	      this.#inflate.on('data', (data) => {
-	        this.#inflate[kBuffer].push(data);
 	        this.#inflate[kLength] += data.length;
+
+	        if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
+	          callback(new MessageSizeExceededError());
+	          this.#inflate.removeAllListeners();
+	          this.#inflate = null;
+	          return
+	        }
+
+	        this.#inflate[kBuffer].push(data);
 	      });
 
 	      this.#inflate.on('error', (err) => {
@@ -32330,6 +34795,10 @@ function requirePermessageDeflate () {
 	    }
 
 	    this.#inflate.flush(() => {
+	      if (!this.#inflate) {
+	        return
+	      }
+
 	      const full = Buffer.concat(this.#inflate[kBuffer], this.#inflate[kLength]);
 
 	      this.#inflate[kBuffer].length = 0;
@@ -32351,8 +34820,8 @@ function requireReceiver () {
 	if (hasRequiredReceiver) return receiver;
 	hasRequiredReceiver = 1;
 
-	const { Writable } = require$$0$1;
-	const assert = require$$0;
+	const { Writable } = require$$0$2;
+	const assert = require$$0$1;
 	const { parserStates, opcodes, states, emptyBuffer, sentCloseFrameState } = requireConstants();
 	const {
 	  isValidStatusCode,
@@ -32366,6 +34835,7 @@ function requireReceiver () {
 	const { failWebsocketConnection } = requireConnection();
 	const { WebsocketFrameSend } = requireFrame();
 	const { PerMessageDeflate } = requirePermessageDeflate();
+	const { MessageSizeExceededError } = requireErrors();
 
 	// This code was influenced by ws released under the MIT license.
 	// Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -32389,14 +34859,27 @@ function requireReceiver () {
 	  /** @type {import('./websocket').Handler} */
 	  #handler
 
-	  constructor (handler, extensions) {
+	  /** @type {number} */
+	  #maxFragments
+
+	  /** @type {number} */
+	  #maxPayloadSize
+
+	  /**
+	   * @param {import('./websocket').Handler} handler
+	   * @param {Map<string, string>|null} extensions
+	   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
+	   */
+	  constructor (handler, extensions, options = {}) {
 	    super();
 
 	    this.#handler = handler;
 	    this.#extensions = extensions == null ? new Map() : extensions;
+	    this.#maxFragments = options.maxFragments ?? 0;
+	    this.#maxPayloadSize = options.maxPayloadSize ?? 0;
 
 	    if (this.#extensions.has('permessage-deflate')) {
-	      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions));
+	      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options));
 	    }
 	  }
 
@@ -32410,6 +34893,19 @@ function requireReceiver () {
 	    this.#loop = true;
 
 	    this.run(callback);
+	  }
+
+	  #validatePayloadLength () {
+	    if (
+	      this.#maxPayloadSize > 0 &&
+	      !isControlFrame(this.#info.opcode) &&
+	      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
+	    ) {
+	      failWebsocketConnection(this.#handler, 1009, 'Payload size exceeds maximum allowed size');
+	      return false
+	    }
+
+	    return true
 	  }
 
 	  /**
@@ -32500,6 +34996,10 @@ function requireReceiver () {
 	        if (payloadLength <= 125) {
 	          this.#info.payloadLength = payloadLength;
 	          this.#state = parserStates.READ_DATA;
+
+	          if (!this.#validatePayloadLength()) {
+	            return
+	          }
 	        } else if (payloadLength === 126) {
 	          this.#state = parserStates.PAYLOADLENGTH_16;
 	        } else if (payloadLength === 127) {
@@ -32524,6 +35024,10 @@ function requireReceiver () {
 
 	        this.#info.payloadLength = buffer.readUInt16BE(0);
 	        this.#state = parserStates.READ_DATA;
+
+	        if (!this.#validatePayloadLength()) {
+	          return
+	        }
 	      } else if (this.#state === parserStates.PAYLOADLENGTH_64) {
 	        if (this.#byteOffset < 8) {
 	          return callback()
@@ -32531,6 +35035,7 @@ function requireReceiver () {
 
 	        const buffer = this.consume(8);
 	        const upper = buffer.readUInt32BE(0);
+	        const lower = buffer.readUInt32BE(4);
 
 	        // 2^31 is the maximum bytes an arraybuffer can contain
 	        // on 32-bit systems. Although, on 64-bit systems, this is
@@ -32538,15 +35043,17 @@ function requireReceiver () {
 	        // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Errors/Invalid_array_length
 	        // https://source.chromium.org/chromium/chromium/src/+/main:v8/src/common/globals.h;drc=1946212ac0100668f14eb9e2843bdd846e510a1e;bpv=1;bpt=1;l=1275
 	        // https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/js-array-buffer.h;l=34;drc=1946212ac0100668f14eb9e2843bdd846e510a1e
-	        if (upper > 2 ** 31 - 1) {
+	        if (upper !== 0 || lower > 2 ** 31 - 1) {
 	          failWebsocketConnection(this.#handler, 1009, 'Received payload length > 2^31 bytes.');
 	          return
 	        }
 
-	        const lower = buffer.readUInt32BE(4);
-
-	        this.#info.payloadLength = (upper << 8) + lower;
+	        this.#info.payloadLength = lower;
 	        this.#state = parserStates.READ_DATA;
+
+	        if (!this.#validatePayloadLength()) {
+	          return
+	        }
 	      } else if (this.#state === parserStates.READ_DATA) {
 	        if (this.#byteOffset < this.#info.payloadLength) {
 	          return callback()
@@ -32559,7 +35066,9 @@ function requireReceiver () {
 	          this.#state = parserStates.INFO;
 	        } else {
 	          if (!this.#info.compressed) {
-	            this.writeFragments(body);
+	            if (!this.writeFragments(body)) {
+	              return
+	            }
 
 	            // If the frame is not fragmented, a message has been received.
 	            // If the frame is fragmented, it will terminate with a fin bit set
@@ -32571,27 +35080,41 @@ function requireReceiver () {
 
 	            this.#state = parserStates.INFO;
 	          } else {
-	            this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
-	              if (error) {
-	                failWebsocketConnection(this.#handler, 1007, error.message);
-	                return
-	              }
+	            this.#extensions.get('permessage-deflate').decompress(
+	              body,
+	              this.#info.fin,
+	              (error, data) => {
+	                if (error) {
+	                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007;
+	                  failWebsocketConnection(this.#handler, code, error.message);
+	                  return
+	                }
 
-	              this.writeFragments(data);
+	                if (!this.writeFragments(data)) {
+	                  return
+	                }
 
-	              if (!this.#info.fin) {
-	                this.#state = parserStates.INFO;
+	                // Check cumulative fragment size
+	                if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
+	                  failWebsocketConnection(this.#handler, 1009, new MessageSizeExceededError().message);
+	                  return
+	                }
+
+	                if (!this.#info.fin) {
+	                  this.#state = parserStates.INFO;
+	                  this.#loop = true;
+	                  this.run(callback);
+	                  return
+	                }
+
+	                websocketMessageReceived(this.#handler, this.#info.binaryType, this.consumeFragments());
+
 	                this.#loop = true;
+	                this.#state = parserStates.INFO;
 	                this.run(callback);
-	                return
-	              }
-
-	              websocketMessageReceived(this.#handler, this.#info.binaryType, this.consumeFragments());
-
-	              this.#loop = true;
-	              this.#state = parserStates.INFO;
-	              this.run(callback);
-	            });
+	              },
+	              this.#fragmentsBytes
+	            );
 
 	            this.#loop = false;
 	            break
@@ -32650,8 +35173,17 @@ function requireReceiver () {
 	  }
 
 	  writeFragments (fragment) {
+	    if (
+	      this.#maxFragments > 0 &&
+	      this.#fragments.length === this.#maxFragments
+	    ) {
+	      failWebsocketConnection(this.#handler, 1008, 'Too many message fragments');
+	      return false
+	    }
+
 	    this.#fragmentsBytes += fragment.length;
 	    this.#fragments.push(fragment);
+	    return true
 	  }
 
 	  consumeFragments () {
@@ -32944,6 +35476,18 @@ function requireWebsocket () {
 	const { SendQueue } = requireSender();
 	const { WebsocketFrameSend } = requireFrame();
 	const { channels } = requireDiagnostics();
+
+	function getSocketAddress (socket) {
+	  if (typeof socket?.address === 'function') {
+	    return socket.address()
+	  }
+
+	  if (typeof socket?.session?.socket?.address === 'function') {
+	    return socket.session.socket.address()
+	  }
+
+	  return null
+	}
 
 	/**
 	 * @typedef {object} Handler
@@ -33372,11 +35916,18 @@ function requireWebsocket () {
 	   * @see https://websockets.spec.whatwg.org/#feedback-from-the-protocol
 	   */
 	  #onConnectionEstablished (response, parsedExtensions) {
-	    // processResponse is called when the "response’s header list has been received and initialized."
+	    // processResponse is called when the "response's header list has been received and initialized."
 	    // once this happens, the connection is open
 	    this.#handler.socket = response.socket;
 
-	    const parser = new ByteParser(this.#handler, parsedExtensions);
+	    const webSocketOptions = this.#handler.controller.dispatcher?.webSocketOptions;
+	    const maxFragments = webSocketOptions?.maxFragments;
+	    const maxPayloadSize = webSocketOptions?.maxPayloadSize;
+
+	    const parser = new ByteParser(this.#handler, parsedExtensions, {
+	      maxFragments,
+	      maxPayloadSize
+	    });
 	    parser.on('drain', () => this.#handler.onParserDrain());
 	    parser.on('error', (err) => this.#handler.onParserError(err));
 
@@ -33411,7 +35962,7 @@ function requireWebsocket () {
 	      // Convert headers to a plain object for the event
 	      const headers = response.headersList.entries;
 	      channels.open.publish({
-	        address: response.socket.address(),
+	        address: getSocketAddress(response.socket),
 	        protocol: this.#protocol,
 	        extensions: this.#extensions,
 	        websocket: this,
@@ -34037,7 +36588,14 @@ function requireWebsocketstream () {
 	  #onConnectionEstablished (response, parsedExtensions) {
 	    this.#handler.socket = response.socket;
 
-	    const parser = new ByteParser(this.#handler, parsedExtensions);
+	    // Get options from dispatcher options
+	    const maxFragments = this.#handler.controller.dispatcher?.webSocketOptions?.maxFragments;
+	    const maxPayloadSize = this.#handler.controller.dispatcher?.webSocketOptions?.maxPayloadSize;
+
+	    const parser = new ByteParser(this.#handler, parsedExtensions, {
+	      maxFragments,
+	      maxPayloadSize
+	    });
 	    parser.on('drain', () => this.#handler.onParserDrain());
 	    parser.on('error', (err) => this.#handler.onParserError(err));
 
@@ -34062,12 +36620,6 @@ function requireWebsocketstream () {
 	    const readable = new ReadableStream({
 	      start: (controller) => {
 	        this.#readableStreamController = controller;
-	      },
-	      pull (controller) {
-	        let chunk;
-	        while (controller.desiredSize > 0 && (chunk = response.socket.read()) !== null) {
-	          controller.enqueue(chunk);
-	        }
 	      },
 	      cancel: (reason) => this.#cancel(reason)
 	    });
@@ -34117,7 +36669,7 @@ function requireWebsocketstream () {
 	      try {
 	        chunk = utf8Decode(data);
 	      } catch {
-	        failWebsocketConnection(this.#handler, 'Received invalid UTF-8 in text frame.');
+	        failWebsocketConnection(this.#handler, 1007, 'Received invalid UTF-8 in text frame.');
 	        return
 	      }
 	    } else if (type === opcodes.BINARY) {
@@ -34320,7 +36872,7 @@ var hasRequiredEventsourceStream;
 function requireEventsourceStream () {
 	if (hasRequiredEventsourceStream) return eventsourceStream;
 	hasRequiredEventsourceStream = 1;
-	const { Transform } = require$$0$1;
+	const { Transform } = require$$0$2;
 	const { isASCIINumber, isValidLastEventId } = requireUtil();
 
 	/**
@@ -34728,7 +37280,7 @@ function requireEventsource () {
 	if (hasRequiredEventsource) return eventsource;
 	hasRequiredEventsource = 1;
 
-	const { pipeline } = require$$0$1;
+	const { pipeline } = require$$0$2;
 	const { fetching } = requireFetch();
 	const { makeRequest } = requireRequest();
 	const { webidl } = requireWebidl();
@@ -35246,6 +37798,7 @@ function requireUndici () {
 		const RoundRobinPool = requireRoundRobinPool();
 		const Agent = requireAgent();
 		const ProxyAgent = requireProxyAgent();
+		const Socks5ProxyAgent = requireSocks5ProxyAgent();
 		const EnvHttpProxyAgent = requireEnvHttpProxyAgent();
 		const RetryAgent = requireRetryAgent();
 		const H2CClient = requireH2cClient();
@@ -35274,6 +37827,7 @@ function requireUndici () {
 		module.exports.RoundRobinPool = RoundRobinPool;
 		module.exports.Agent = Agent;
 		module.exports.ProxyAgent = ProxyAgent;
+		module.exports.Socks5ProxyAgent = Socks5ProxyAgent;
 		module.exports.EnvHttpProxyAgent = EnvHttpProxyAgent;
 		module.exports.RetryAgent = RetryAgent;
 		module.exports.H2CClient = H2CClient;
@@ -35667,6 +38221,27 @@ function getInput(name, options) {
         return val;
     }
     return val.trim();
+}
+/**
+ * Gets the input value of the boolean type in the YAML 1.2 "core schema" specification.
+ * Support boolean input list: `true | True | TRUE | false | False | FALSE` .
+ * The return value is also in boolean type.
+ * ref: https://yaml.org/spec/1.2/spec.html#id2804923
+ *
+ * @param     name     name of the input to get
+ * @param     options  optional. See InputOptions.
+ * @returns   boolean
+ */
+function getBooleanInput(name, options) {
+    const trueValue = ['true', 'True', 'TRUE'];
+    const falseValue = ['false', 'False', 'FALSE'];
+    const val = getInput(name, options);
+    if (trueValue.includes(val))
+        return true;
+    if (falseValue.includes(val))
+        return false;
+    throw new TypeError(`Input does not meet YAML 1.2 "Core Schema" specification: ${name}\n` +
+        `Support boolean input list: \`true | True | TRUE | false | False | FALSE\``);
 }
 //-----------------------------------------------------------------------
 // Results
@@ -36640,6 +39215,19 @@ function getProxyFetch(destinationUrl) {
 function getApiBaseUrl() {
     return process.env['GITHUB_API_URL'] || 'https://api.github.com';
 }
+function getUserAgentWithOrchestrationId(baseUserAgent) {
+    var _a;
+    const orchId = (_a = process.env['ACTIONS_ORCHESTRATION_ID']) === null || _a === void 0 ? void 0 : _a.trim();
+    if (orchId) {
+        const sanitizedId = orchId.replace(/[^a-z0-9_.-]/gi, '_');
+        const tag = `actions_orchestration_id/${sanitizedId}`;
+        if (baseUserAgent === null || baseUserAgent === void 0 ? void 0 : baseUserAgent.includes(tag))
+            return baseUserAgent;
+        const ua = baseUserAgent ? `${baseUserAgent} ` : '';
+        return `${ua}${tag}`;
+    }
+    return baseUserAgent;
+}
 
 function getUserAgent() {
   if (typeof navigator === "object" && "userAgent" in navigator) {
@@ -37306,14 +39894,38 @@ function requireFastContentTypeParse () {
 
 var fastContentTypeParseExports = requireFastContentTypeParse();
 
+const intRegex = /^-?\d+$/;
 const noiseValue = /^-?\d+n+$/; // Noise - strings that match the custom format before being converted to it
 const originalStringify = JSON.stringify;
 const originalParse = JSON.parse;
+const customFormat = /^-?\d+n$/;
 
-/*
-  Function to serialize value to a JSON string.
-  Converts BigInt values to a custom format (strings with digits and "n" at the end) and then converts them to proper big integers in a JSON string.
-*/
+const bigIntsStringify = /([\[:])?"(-?\d+)n"($|([\\n]|\s)*(\s|[\\n])*[,\}\]])/g;
+const noiseStringify =
+  /([\[:])?("-?\d+n+)n("$|"([\\n]|\s)*(\s|[\\n])*[,\}\]])/g;
+
+/**
+ * @typedef {(this: any, key: string | number | undefined, value: any) => any} Replacer
+ * @typedef {(key: string | number | undefined, value: any, context?: { source: string }) => any} Reviver
+ */
+
+/**
+ * Converts a JavaScript value to a JSON string.
+ *
+ * Supports serialization of BigInt values using two strategies:
+ * 1. Custom format "123n" → "123" (universal fallback)
+ * 2. Native JSON.rawJSON() (Node.js 22+, fastest) when available
+ *
+ * All other values are serialized exactly like native JSON.stringify().
+ *
+ * @param {*} value The value to convert to a JSON string.
+ * @param {Replacer | Array<string | number> | null} [replacer]
+ *   A function that alters the behavior of the stringification process,
+ *   or an array of strings/numbers to indicate properties to exclude.
+ * @param {string | number} [space]
+ *   A string or number to specify indentation or pretty-printing.
+ * @returns {string} The JSON string representation.
+ */
 const JSONStringify = (value, replacer, space) => {
   if ("rawJSON" in JSON) {
     return originalStringify(
@@ -37325,19 +39937,16 @@ const JSONStringify = (value, replacer, space) => {
 
         return value;
       },
-      space
+      space,
     );
   }
 
   if (!value) return originalStringify(value, replacer, space);
 
-  const bigInts = /([\[:])?"(-?\d+)n"($|([\\n]|\s)*(\s|[\\n])*[,\}\]])/g;
-  const noise = /([\[:])?("-?\d+n+)n("$|"([\\n]|\s)*(\s|[\\n])*[,\}\]])/g;
   const convertedToCustomJSON = originalStringify(
     value,
     (key, value) => {
-      const isNoise =
-        typeof value === "string" && Boolean(value.match(noiseValue));
+      const isNoise = typeof value === "string" && noiseValue.test(value);
 
       if (isNoise) return value.toString() + "n"; // Mark noise values with additional "n" to offset the deletion of one "n" during the processing
 
@@ -37347,33 +39956,87 @@ const JSONStringify = (value, replacer, space) => {
 
       return value;
     },
-    space
+    space,
   );
-  const processedJSON = convertedToCustomJSON.replace(bigInts, "$1$2$3"); // Delete one "n" off the end of every BigInt value
-  const denoisedJSON = processedJSON.replace(noise, "$1$2$3"); // Remove one "n" off the end of every noisy string
+  const processedJSON = convertedToCustomJSON.replace(
+    bigIntsStringify,
+    "$1$2$3",
+  ); // Delete one "n" off the end of every BigInt value
+  const denoisedJSON = processedJSON.replace(noiseStringify, "$1$2$3"); // Remove one "n" off the end of every noisy string
 
   return denoisedJSON;
 };
 
-/*
-  Function to check if the JSON.parse's context.source feature is supported.
-*/
-const isContextSourceSupported = () =>
-  JSON.parse("1", (_, __, context) => !!context && context.source === "1");
+const featureCache = new Map();
 
-/*
-  Faster (2x) and simpler function to parse JSON.
-  Based on JSON.parse's context.source feature, which is not universally available now.
-  Does not support the legacy custom format, used in the first version of this library.
-*/
+/**
+ * Detects if the current JSON.parse implementation supports the context.source feature.
+ *
+ * Uses toString() fingerprinting to cache results and automatically detect runtime
+ * replacements of JSON.parse (polyfills, mocks, etc.).
+ *
+ * @returns {boolean} true if context.source is supported, false otherwise.
+ */
+const isContextSourceSupported = () => {
+  const parseFingerprint = JSON.parse.toString();
+
+  if (featureCache.has(parseFingerprint)) {
+    return featureCache.get(parseFingerprint);
+  }
+
+  try {
+    const result = JSON.parse(
+      "1",
+      (_, __, context) => !!context?.source && context.source === "1",
+    );
+    featureCache.set(parseFingerprint, result);
+
+    return result;
+  } catch {
+    featureCache.set(parseFingerprint, false);
+
+    return false;
+  }
+};
+
+/**
+ * Reviver function that converts custom-format BigInt strings back to BigInt values.
+ * Also handles "noise" strings that accidentally match the BigInt format.
+ *
+ * @param {string | number | undefined} key The object key.
+ * @param {*} value The value being parsed.
+ * @param {object} [context] Parse context (if supported by JSON.parse).
+ * @param {Reviver} [userReviver] User's custom reviver function.
+ * @returns {any} The transformed value.
+ */
+const convertMarkedBigIntsReviver = (key, value, context, userReviver) => {
+  const isCustomFormatBigInt =
+    typeof value === "string" && customFormat.test(value);
+  if (isCustomFormatBigInt) return BigInt(value.slice(0, -1));
+
+  const isNoiseValue = typeof value === "string" && noiseValue.test(value);
+  if (isNoiseValue) return value.slice(0, -1);
+
+  return value;
+};
+
+/**
+ * Fast JSON.parse implementation (~2x faster than classic fallback).
+ * Uses JSON.parse's context.source feature to detect integers and convert
+ * large numbers directly to BigInt without string manipulation.
+ *
+ * Does not support legacy custom format from v1 of this library.
+ *
+ * @param {string} text JSON string to parse.
+ * @param {Reviver} [reviver] Transform function to apply to each value.
+ * @returns {any} Parsed JavaScript value.
+ */
 const JSONParseV2 = (text, reviver) => {
-  const intRegex = /^-?\d+$/;
-
   return JSON.parse(text, (key, value, context) => {
     const isBigNumber =
       typeof value === "number" &&
       (value > Number.MAX_SAFE_INTEGER || value < Number.MIN_SAFE_INTEGER);
-    const isInt = intRegex.test(context.source);
+    const isInt = context && intRegex.test(context.source);
     const isBigInt = isBigNumber && isInt;
 
     if (isBigInt) return BigInt(context.source);
@@ -37382,29 +40045,40 @@ const JSONParseV2 = (text, reviver) => {
   });
 };
 
-/*
-  Function to parse JSON.
-  If JSON has number values greater than Number.MAX_SAFE_INTEGER, we convert those values to a custom format, then parse them to BigInt values.
-  Other types of values are not affected and parsed as native JSON.parse() would parse them.
-*/
+const MAX_INT = Number.MAX_SAFE_INTEGER.toString();
+const MAX_DIGITS = MAX_INT.length;
+const stringsOrLargeNumbers =
+  /"(?:\\.|[^"])*"|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/g;
+const noiseValueWithQuotes = /^"-?\d+n+"$/; // Noise - strings that match the custom format before being converted to it
+
+/**
+ * Converts a JSON string into a JavaScript value.
+ *
+ * Supports parsing of large integers using two strategies:
+ * 1. Classic fallback: Marks large numbers with "123n" format, then converts to BigInt
+ * 2. Fast path (JSONParseV2): Uses context.source feature (~2x faster) when available
+ *
+ * All other JSON values are parsed exactly like native JSON.parse().
+ *
+ * @param {string} text A valid JSON string.
+ * @param {Reviver} [reviver]
+ *   A function that transforms the results. This function is called for each member
+ *   of the object. If a member contains nested objects, the nested objects are
+ *   transformed before the parent object is.
+ * @returns {any} The parsed JavaScript value.
+ * @throws {SyntaxError} If text is not valid JSON.
+ */
 const JSONParse = (text, reviver) => {
   if (!text) return originalParse(text, reviver);
 
   if (isContextSourceSupported()) return JSONParseV2(text); // Shortcut to a faster (2x) and simpler version
-
-  const MAX_INT = Number.MAX_SAFE_INTEGER.toString();
-  const MAX_DIGITS = MAX_INT.length;
-  const stringsOrLargeNumbers =
-    /"(?:\\.|[^"])*"|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/g;
-  const noiseValueWithQuotes = /^"-?\d+n+"$/; // Noise - strings that match the custom format before being converted to it
-  const customFormat = /^-?\d+n$/;
 
   // Find and mark big numbers with "n"
   const serializedData = text.replace(
     stringsOrLargeNumbers,
     (text, digits, fractional, exponential) => {
       const isString = text[0] === '"';
-      const isNoise = isString && Boolean(text.match(noiseValueWithQuotes));
+      const isNoise = isString && noiseValueWithQuotes.test(text);
 
       if (isNoise) return text.substring(0, text.length - 1) + 'n"'; // Mark noise values with additional "n" to offset the deletion of one "n" during the processing
 
@@ -37418,24 +40092,12 @@ const JSONParse = (text, reviver) => {
         return text;
 
       return '"' + text + 'n"';
-    }
+    },
   );
 
-  // Convert marked big numbers to BigInt
-  return originalParse(serializedData, (key, value, context) => {
-    const isCustomFormatBigInt =
-      typeof value === "string" && Boolean(value.match(customFormat));
-
-    if (isCustomFormatBigInt)
-      return BigInt(value.substring(0, value.length - 1));
-
-    const isNoiseValue =
-      typeof value === "string" && Boolean(value.match(noiseValue));
-
-    if (isNoiseValue) return value.substring(0, value.length - 1); // Remove one "n" off the end of the noisy string
-
-    return value;
-  });
+  return originalParse(serializedData, (key, value, context) =>
+    convertMarkedBigIntsReviver(key, value),
+  );
 };
 
 class RequestError extends Error {
@@ -40544,6 +43206,11 @@ function getOctokitOptions(token, options) {
     if (auth) {
         opts.auth = auth;
     }
+    // Orchestration ID
+    const userAgent = getUserAgentWithOrchestrationId(opts.userAgent);
+    if (userAgent) {
+        opts.userAgent = userAgent;
+    }
     return opts;
 }
 
@@ -40594,2512 +43261,2091 @@ function getEcosystemLanguageMapping(repoLanguages) {
     return mapping;
 }
 
-/*! js-yaml 4.1.1 https://github.com/nodeca/js-yaml @license MIT */
-function isNothing(subject) {
-  return (typeof subject === 'undefined') || (subject === null);
+function getDefaultExportFromCjs(x) {
+  return x && x.__esModule && Object.prototype.hasOwnProperty.call(x, "default") ? x["default"] : x;
 }
-
-
-function isObject(subject) {
-  return (typeof subject === 'object') && (subject !== null);
-}
-
-
-function toArray(sequence) {
-  if (Array.isArray(sequence)) return sequence;
-  else if (isNothing(sequence)) return [];
-
-  return [ sequence ];
-}
-
-
-function extend(target, source) {
-  var index, length, key, sourceKeys;
-
-  if (source) {
-    sourceKeys = Object.keys(source);
-
-    for (index = 0, length = sourceKeys.length; index < length; index += 1) {
-      key = sourceKeys[index];
-      target[key] = source[key];
-    }
+var jsYaml = {};
+var loader = {};
+var common = {};
+var hasRequiredCommon;
+function requireCommon() {
+  if (hasRequiredCommon) return common;
+  hasRequiredCommon = 1;
+  function isNothing(subject) {
+    return typeof subject === "undefined" || subject === null;
   }
-
-  return target;
-}
-
-
-function repeat(string, count) {
-  var result = '', cycle;
-
-  for (cycle = 0; cycle < count; cycle += 1) {
-    result += string;
+  function isObject(subject) {
+    return typeof subject === "object" && subject !== null;
   }
-
-  return result;
-}
-
-
-function isNegativeZero(number) {
-  return (number === 0) && (Number.NEGATIVE_INFINITY === 1 / number);
-}
-
-
-var isNothing_1      = isNothing;
-var isObject_1       = isObject;
-var toArray_1        = toArray;
-var repeat_1         = repeat;
-var isNegativeZero_1 = isNegativeZero;
-var extend_1         = extend;
-
-var common = {
-	isNothing: isNothing_1,
-	isObject: isObject_1,
-	toArray: toArray_1,
-	repeat: repeat_1,
-	isNegativeZero: isNegativeZero_1,
-	extend: extend_1
-};
-
-// YAML error class. http://stackoverflow.com/questions/8458984
-
-
-function formatError(exception, compact) {
-  var where = '', message = exception.reason || '(unknown reason)';
-
-  if (!exception.mark) return message;
-
-  if (exception.mark.name) {
-    where += 'in "' + exception.mark.name + '" ';
+  function toArray(sequence) {
+    if (Array.isArray(sequence)) return sequence;
+    else if (isNothing(sequence)) return [];
+    return [sequence];
   }
-
-  where += '(' + (exception.mark.line + 1) + ':' + (exception.mark.column + 1) + ')';
-
-  if (!compact && exception.mark.snippet) {
-    where += '\n\n' + exception.mark.snippet;
-  }
-
-  return message + ' ' + where;
-}
-
-
-function YAMLException$1(reason, mark) {
-  // Super constructor
-  Error.call(this);
-
-  this.name = 'YAMLException';
-  this.reason = reason;
-  this.mark = mark;
-  this.message = formatError(this, false);
-
-  // Include stack trace in error object
-  if (Error.captureStackTrace) {
-    // Chrome and NodeJS
-    Error.captureStackTrace(this, this.constructor);
-  } else {
-    // FF, IE 10+ and Safari 6+. Fallback for others
-    this.stack = (new Error()).stack || '';
-  }
-}
-
-
-// Inherit from Error
-YAMLException$1.prototype = Object.create(Error.prototype);
-YAMLException$1.prototype.constructor = YAMLException$1;
-
-
-YAMLException$1.prototype.toString = function toString(compact) {
-  return this.name + ': ' + formatError(this, compact);
-};
-
-
-var exception = YAMLException$1;
-
-// get snippet for a single line, respecting maxLength
-function getLine(buffer, lineStart, lineEnd, position, maxLineLength) {
-  var head = '';
-  var tail = '';
-  var maxHalfLength = Math.floor(maxLineLength / 2) - 1;
-
-  if (position - lineStart > maxHalfLength) {
-    head = ' ... ';
-    lineStart = position - maxHalfLength + head.length;
-  }
-
-  if (lineEnd - position > maxHalfLength) {
-    tail = ' ...';
-    lineEnd = position + maxHalfLength - tail.length;
-  }
-
-  return {
-    str: head + buffer.slice(lineStart, lineEnd).replace(/\t/g, '→') + tail,
-    pos: position - lineStart + head.length // relative position
-  };
-}
-
-
-function padStart(string, max) {
-  return common.repeat(' ', max - string.length) + string;
-}
-
-
-function makeSnippet(mark, options) {
-  options = Object.create(options || null);
-
-  if (!mark.buffer) return null;
-
-  if (!options.maxLength) options.maxLength = 79;
-  if (typeof options.indent      !== 'number') options.indent      = 1;
-  if (typeof options.linesBefore !== 'number') options.linesBefore = 3;
-  if (typeof options.linesAfter  !== 'number') options.linesAfter  = 2;
-
-  var re = /\r?\n|\r|\0/g;
-  var lineStarts = [ 0 ];
-  var lineEnds = [];
-  var match;
-  var foundLineNo = -1;
-
-  while ((match = re.exec(mark.buffer))) {
-    lineEnds.push(match.index);
-    lineStarts.push(match.index + match[0].length);
-
-    if (mark.position <= match.index && foundLineNo < 0) {
-      foundLineNo = lineStarts.length - 2;
-    }
-  }
-
-  if (foundLineNo < 0) foundLineNo = lineStarts.length - 1;
-
-  var result = '', i, line;
-  var lineNoLength = Math.min(mark.line + options.linesAfter, lineEnds.length).toString().length;
-  var maxLineLength = options.maxLength - (options.indent + lineNoLength + 3);
-
-  for (i = 1; i <= options.linesBefore; i++) {
-    if (foundLineNo - i < 0) break;
-    line = getLine(
-      mark.buffer,
-      lineStarts[foundLineNo - i],
-      lineEnds[foundLineNo - i],
-      mark.position - (lineStarts[foundLineNo] - lineStarts[foundLineNo - i]),
-      maxLineLength
-    );
-    result = common.repeat(' ', options.indent) + padStart((mark.line - i + 1).toString(), lineNoLength) +
-      ' | ' + line.str + '\n' + result;
-  }
-
-  line = getLine(mark.buffer, lineStarts[foundLineNo], lineEnds[foundLineNo], mark.position, maxLineLength);
-  result += common.repeat(' ', options.indent) + padStart((mark.line + 1).toString(), lineNoLength) +
-    ' | ' + line.str + '\n';
-  result += common.repeat('-', options.indent + lineNoLength + 3 + line.pos) + '^' + '\n';
-
-  for (i = 1; i <= options.linesAfter; i++) {
-    if (foundLineNo + i >= lineEnds.length) break;
-    line = getLine(
-      mark.buffer,
-      lineStarts[foundLineNo + i],
-      lineEnds[foundLineNo + i],
-      mark.position - (lineStarts[foundLineNo] - lineStarts[foundLineNo + i]),
-      maxLineLength
-    );
-    result += common.repeat(' ', options.indent) + padStart((mark.line + i + 1).toString(), lineNoLength) +
-      ' | ' + line.str + '\n';
-  }
-
-  return result.replace(/\n$/, '');
-}
-
-
-var snippet = makeSnippet;
-
-var TYPE_CONSTRUCTOR_OPTIONS = [
-  'kind',
-  'multi',
-  'resolve',
-  'construct',
-  'instanceOf',
-  'predicate',
-  'represent',
-  'representName',
-  'defaultStyle',
-  'styleAliases'
-];
-
-var YAML_NODE_KINDS = [
-  'scalar',
-  'sequence',
-  'mapping'
-];
-
-function compileStyleAliases(map) {
-  var result = {};
-
-  if (map !== null) {
-    Object.keys(map).forEach(function (style) {
-      map[style].forEach(function (alias) {
-        result[String(alias)] = style;
-      });
-    });
-  }
-
-  return result;
-}
-
-function Type$1(tag, options) {
-  options = options || {};
-
-  Object.keys(options).forEach(function (name) {
-    if (TYPE_CONSTRUCTOR_OPTIONS.indexOf(name) === -1) {
-      throw new exception('Unknown option "' + name + '" is met in definition of "' + tag + '" YAML type.');
-    }
-  });
-
-  // TODO: Add tag format check.
-  this.options       = options; // keep original options in case user wants to extend this type later
-  this.tag           = tag;
-  this.kind          = options['kind']          || null;
-  this.resolve       = options['resolve']       || function () { return true; };
-  this.construct     = options['construct']     || function (data) { return data; };
-  this.instanceOf    = options['instanceOf']    || null;
-  this.predicate     = options['predicate']     || null;
-  this.represent     = options['represent']     || null;
-  this.representName = options['representName'] || null;
-  this.defaultStyle  = options['defaultStyle']  || null;
-  this.multi         = options['multi']         || false;
-  this.styleAliases  = compileStyleAliases(options['styleAliases'] || null);
-
-  if (YAML_NODE_KINDS.indexOf(this.kind) === -1) {
-    throw new exception('Unknown kind "' + this.kind + '" is specified for "' + tag + '" YAML type.');
-  }
-}
-
-var type = Type$1;
-
-/*eslint-disable max-len*/
-
-
-
-
-
-function compileList(schema, name) {
-  var result = [];
-
-  schema[name].forEach(function (currentType) {
-    var newIndex = result.length;
-
-    result.forEach(function (previousType, previousIndex) {
-      if (previousType.tag === currentType.tag &&
-          previousType.kind === currentType.kind &&
-          previousType.multi === currentType.multi) {
-
-        newIndex = previousIndex;
+  function extend(target, source) {
+    if (source) {
+      const sourceKeys = Object.keys(source);
+      for (let index = 0, length = sourceKeys.length; index < length; index += 1) {
+        const key = sourceKeys[index];
+        target[key] = source[key];
       }
-    });
-
-    result[newIndex] = currentType;
-  });
-
-  return result;
+    }
+    return target;
+  }
+  function repeat(string, count) {
+    let result = "";
+    for (let cycle = 0; cycle < count; cycle += 1) {
+      result += string;
+    }
+    return result;
+  }
+  function isNegativeZero(number) {
+    return number === 0 && Number.NEGATIVE_INFINITY === 1 / number;
+  }
+  common.isNothing = isNothing;
+  common.isObject = isObject;
+  common.toArray = toArray;
+  common.repeat = repeat;
+  common.isNegativeZero = isNegativeZero;
+  common.extend = extend;
+  return common;
 }
-
-
-function compileMap(/* lists... */) {
-  var result = {
-        scalar: {},
-        sequence: {},
-        mapping: {},
-        fallback: {},
-        multi: {
-          scalar: [],
-          sequence: [],
-          mapping: [],
-          fallback: []
-        }
-      }, index, length;
-
-  function collectType(type) {
-    if (type.multi) {
-      result.multi[type.kind].push(type);
-      result.multi['fallback'].push(type);
+var exception;
+var hasRequiredException;
+function requireException() {
+  if (hasRequiredException) return exception;
+  hasRequiredException = 1;
+  function formatError(exception2, compact) {
+    let where = "";
+    const message = exception2.reason || "(unknown reason)";
+    if (!exception2.mark) return message;
+    if (exception2.mark.name) {
+      where += 'in "' + exception2.mark.name + '" ';
+    }
+    where += "(" + (exception2.mark.line + 1) + ":" + (exception2.mark.column + 1) + ")";
+    if (!compact && exception2.mark.snippet) {
+      where += "\n\n" + exception2.mark.snippet;
+    }
+    return message + " " + where;
+  }
+  function YAMLException2(reason, mark) {
+    Error.call(this);
+    this.name = "YAMLException";
+    this.reason = reason;
+    this.mark = mark;
+    this.message = formatError(this, false);
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, this.constructor);
     } else {
-      result[type.kind][type.tag] = result['fallback'][type.tag] = type;
+      this.stack = new Error().stack || "";
     }
   }
-
-  for (index = 0, length = arguments.length; index < length; index += 1) {
-    arguments[index].forEach(collectType);
-  }
-  return result;
+  YAMLException2.prototype = Object.create(Error.prototype);
+  YAMLException2.prototype.constructor = YAMLException2;
+  YAMLException2.prototype.toString = function toString(compact) {
+    return this.name + ": " + formatError(this, compact);
+  };
+  exception = YAMLException2;
+  return exception;
 }
-
-
-function Schema$1(definition) {
-  return this.extend(definition);
-}
-
-
-Schema$1.prototype.extend = function extend(definition) {
-  var implicit = [];
-  var explicit = [];
-
-  if (definition instanceof type) {
-    // Schema.extend(type)
-    explicit.push(definition);
-
-  } else if (Array.isArray(definition)) {
-    // Schema.extend([ type1, type2, ... ])
-    explicit = explicit.concat(definition);
-
-  } else if (definition && (Array.isArray(definition.implicit) || Array.isArray(definition.explicit))) {
-    // Schema.extend({ explicit: [ type1, type2, ... ], implicit: [ type1, type2, ... ] })
-    if (definition.implicit) implicit = implicit.concat(definition.implicit);
-    if (definition.explicit) explicit = explicit.concat(definition.explicit);
-
-  } else {
-    throw new exception('Schema.extend argument should be a Type, [ Type ], ' +
-      'or a schema definition ({ implicit: [...], explicit: [...] })');
+var snippet;
+var hasRequiredSnippet;
+function requireSnippet() {
+  if (hasRequiredSnippet) return snippet;
+  hasRequiredSnippet = 1;
+  const common2 = requireCommon();
+  function getLine(buffer, lineStart, lineEnd, position, maxLineLength) {
+    let head = "";
+    let tail = "";
+    const maxHalfLength = Math.floor(maxLineLength / 2) - 1;
+    if (position - lineStart > maxHalfLength) {
+      head = " ... ";
+      lineStart = position - maxHalfLength + head.length;
+    }
+    if (lineEnd - position > maxHalfLength) {
+      tail = " ...";
+      lineEnd = position + maxHalfLength - tail.length;
+    }
+    return {
+      str: head + buffer.slice(lineStart, lineEnd).replace(/\t/g, "→") + tail,
+      pos: position - lineStart + head.length
+      // relative position
+    };
   }
-
-  implicit.forEach(function (type$1) {
-    if (!(type$1 instanceof type)) {
-      throw new exception('Specified list of YAML types (or a single Type object) contains a non-Type object.');
+  function padStart(string, max) {
+    return common2.repeat(" ", max - string.length) + string;
+  }
+  function makeSnippet(mark, options) {
+    options = Object.create(options || null);
+    if (!mark.buffer) return null;
+    if (!options.maxLength) options.maxLength = 79;
+    if (typeof options.indent !== "number") options.indent = 1;
+    if (typeof options.linesBefore !== "number") options.linesBefore = 3;
+    if (typeof options.linesAfter !== "number") options.linesAfter = 2;
+    const re = /\r?\n|\r|\0/g;
+    const lineStarts = [0];
+    const lineEnds = [];
+    let match;
+    let foundLineNo = -1;
+    while (match = re.exec(mark.buffer)) {
+      lineEnds.push(match.index);
+      lineStarts.push(match.index + match[0].length);
+      if (mark.position <= match.index && foundLineNo < 0) {
+        foundLineNo = lineStarts.length - 2;
+      }
     }
-
-    if (type$1.loadKind && type$1.loadKind !== 'scalar') {
-      throw new exception('There is a non-scalar type in the implicit list of a schema. Implicit resolving of such types is not supported.');
+    if (foundLineNo < 0) foundLineNo = lineStarts.length - 1;
+    let result = "";
+    const lineNoLength = Math.min(mark.line + options.linesAfter, lineEnds.length).toString().length;
+    const maxLineLength = options.maxLength - (options.indent + lineNoLength + 3);
+    for (let i = 1; i <= options.linesBefore; i++) {
+      if (foundLineNo - i < 0) break;
+      const line2 = getLine(
+        mark.buffer,
+        lineStarts[foundLineNo - i],
+        lineEnds[foundLineNo - i],
+        mark.position - (lineStarts[foundLineNo] - lineStarts[foundLineNo - i]),
+        maxLineLength
+      );
+      result = common2.repeat(" ", options.indent) + padStart((mark.line - i + 1).toString(), lineNoLength) + " | " + line2.str + "\n" + result;
     }
-
-    if (type$1.multi) {
-      throw new exception('There is a multi type in the implicit list of a schema. Multi tags can only be listed as explicit.');
+    const line = getLine(mark.buffer, lineStarts[foundLineNo], lineEnds[foundLineNo], mark.position, maxLineLength);
+    result += common2.repeat(" ", options.indent) + padStart((mark.line + 1).toString(), lineNoLength) + " | " + line.str + "\n";
+    result += common2.repeat("-", options.indent + lineNoLength + 3 + line.pos) + "^\n";
+    for (let i = 1; i <= options.linesAfter; i++) {
+      if (foundLineNo + i >= lineEnds.length) break;
+      const line2 = getLine(
+        mark.buffer,
+        lineStarts[foundLineNo + i],
+        lineEnds[foundLineNo + i],
+        mark.position - (lineStarts[foundLineNo] - lineStarts[foundLineNo + i]),
+        maxLineLength
+      );
+      result += common2.repeat(" ", options.indent) + padStart((mark.line + i + 1).toString(), lineNoLength) + " | " + line2.str + "\n";
+    }
+    return result.replace(/\n$/, "");
+  }
+  snippet = makeSnippet;
+  return snippet;
+}
+var type;
+var hasRequiredType;
+function requireType() {
+  if (hasRequiredType) return type;
+  hasRequiredType = 1;
+  const YAMLException2 = requireException();
+  const TYPE_CONSTRUCTOR_OPTIONS = [
+    "kind",
+    "multi",
+    "resolve",
+    "construct",
+    "instanceOf",
+    "predicate",
+    "represent",
+    "representName",
+    "defaultStyle",
+    "styleAliases"
+  ];
+  const YAML_NODE_KINDS = [
+    "scalar",
+    "sequence",
+    "mapping"
+  ];
+  function compileStyleAliases(map2) {
+    const result = {};
+    if (map2 !== null) {
+      Object.keys(map2).forEach(function(style) {
+        map2[style].forEach(function(alias) {
+          result[String(alias)] = style;
+        });
+      });
+    }
+    return result;
+  }
+  function Type2(tag, options) {
+    options = options || {};
+    Object.keys(options).forEach(function(name) {
+      if (TYPE_CONSTRUCTOR_OPTIONS.indexOf(name) === -1) {
+        throw new YAMLException2('Unknown option "' + name + '" is met in definition of "' + tag + '" YAML type.');
+      }
+    });
+    this.options = options;
+    this.tag = tag;
+    this.kind = options["kind"] || null;
+    this.resolve = options["resolve"] || function() {
+      return true;
+    };
+    this.construct = options["construct"] || function(data) {
+      return data;
+    };
+    this.instanceOf = options["instanceOf"] || null;
+    this.predicate = options["predicate"] || null;
+    this.represent = options["represent"] || null;
+    this.representName = options["representName"] || null;
+    this.defaultStyle = options["defaultStyle"] || null;
+    this.multi = options["multi"] || false;
+    this.styleAliases = compileStyleAliases(options["styleAliases"] || null);
+    if (YAML_NODE_KINDS.indexOf(this.kind) === -1) {
+      throw new YAMLException2('Unknown kind "' + this.kind + '" is specified for "' + tag + '" YAML type.');
+    }
+  }
+  type = Type2;
+  return type;
+}
+var schema;
+var hasRequiredSchema;
+function requireSchema() {
+  if (hasRequiredSchema) return schema;
+  hasRequiredSchema = 1;
+  const YAMLException2 = requireException();
+  const Type2 = requireType();
+  function compileList(schema2, name) {
+    const result = [];
+    schema2[name].forEach(function(currentType) {
+      let newIndex = result.length;
+      result.forEach(function(previousType, previousIndex) {
+        if (previousType.tag === currentType.tag && previousType.kind === currentType.kind && previousType.multi === currentType.multi) {
+          newIndex = previousIndex;
+        }
+      });
+      result[newIndex] = currentType;
+    });
+    return result;
+  }
+  function compileMap() {
+    const result = {
+      scalar: {},
+      sequence: {},
+      mapping: {},
+      fallback: {},
+      multi: {
+        scalar: [],
+        sequence: [],
+        mapping: [],
+        fallback: []
+      }
+    };
+    function collectType(type2) {
+      if (type2.multi) {
+        result.multi[type2.kind].push(type2);
+        result.multi["fallback"].push(type2);
+      } else {
+        result[type2.kind][type2.tag] = result["fallback"][type2.tag] = type2;
+      }
+    }
+    for (let index = 0, length = arguments.length; index < length; index += 1) {
+      arguments[index].forEach(collectType);
+    }
+    return result;
+  }
+  function Schema2(definition) {
+    return this.extend(definition);
+  }
+  Schema2.prototype.extend = function extend(definition) {
+    let implicit = [];
+    let explicit = [];
+    if (definition instanceof Type2) {
+      explicit.push(definition);
+    } else if (Array.isArray(definition)) {
+      explicit = explicit.concat(definition);
+    } else if (definition && (Array.isArray(definition.implicit) || Array.isArray(definition.explicit))) {
+      if (definition.implicit) implicit = implicit.concat(definition.implicit);
+      if (definition.explicit) explicit = explicit.concat(definition.explicit);
+    } else {
+      throw new YAMLException2("Schema.extend argument should be a Type, [ Type ], or a schema definition ({ implicit: [...], explicit: [...] })");
+    }
+    implicit.forEach(function(type2) {
+      if (!(type2 instanceof Type2)) {
+        throw new YAMLException2("Specified list of YAML types (or a single Type object) contains a non-Type object.");
+      }
+      if (type2.loadKind && type2.loadKind !== "scalar") {
+        throw new YAMLException2("There is a non-scalar type in the implicit list of a schema. Implicit resolving of such types is not supported.");
+      }
+      if (type2.multi) {
+        throw new YAMLException2("There is a multi type in the implicit list of a schema. Multi tags can only be listed as explicit.");
+      }
+    });
+    explicit.forEach(function(type2) {
+      if (!(type2 instanceof Type2)) {
+        throw new YAMLException2("Specified list of YAML types (or a single Type object) contains a non-Type object.");
+      }
+    });
+    const result = Object.create(Schema2.prototype);
+    result.implicit = (this.implicit || []).concat(implicit);
+    result.explicit = (this.explicit || []).concat(explicit);
+    result.compiledImplicit = compileList(result, "implicit");
+    result.compiledExplicit = compileList(result, "explicit");
+    result.compiledTypeMap = compileMap(result.compiledImplicit, result.compiledExplicit);
+    return result;
+  };
+  schema = Schema2;
+  return schema;
+}
+var str;
+var hasRequiredStr;
+function requireStr() {
+  if (hasRequiredStr) return str;
+  hasRequiredStr = 1;
+  const Type2 = requireType();
+  str = new Type2("tag:yaml.org,2002:str", {
+    kind: "scalar",
+    construct: function(data) {
+      return data !== null ? data : "";
     }
   });
-
-  explicit.forEach(function (type$1) {
-    if (!(type$1 instanceof type)) {
-      throw new exception('Specified list of YAML types (or a single Type object) contains a non-Type object.');
+  return str;
+}
+var seq;
+var hasRequiredSeq;
+function requireSeq() {
+  if (hasRequiredSeq) return seq;
+  hasRequiredSeq = 1;
+  const Type2 = requireType();
+  seq = new Type2("tag:yaml.org,2002:seq", {
+    kind: "sequence",
+    construct: function(data) {
+      return data !== null ? data : [];
     }
   });
-
-  var result = Object.create(Schema$1.prototype);
-
-  result.implicit = (this.implicit || []).concat(implicit);
-  result.explicit = (this.explicit || []).concat(explicit);
-
-  result.compiledImplicit = compileList(result, 'implicit');
-  result.compiledExplicit = compileList(result, 'explicit');
-  result.compiledTypeMap  = compileMap(result.compiledImplicit, result.compiledExplicit);
-
-  return result;
-};
-
-
-var schema = Schema$1;
-
-var str = new type('tag:yaml.org,2002:str', {
-  kind: 'scalar',
-  construct: function (data) { return data !== null ? data : ''; }
-});
-
-var seq = new type('tag:yaml.org,2002:seq', {
-  kind: 'sequence',
-  construct: function (data) { return data !== null ? data : []; }
-});
-
-var map = new type('tag:yaml.org,2002:map', {
-  kind: 'mapping',
-  construct: function (data) { return data !== null ? data : {}; }
-});
-
-var failsafe = new schema({
-  explicit: [
-    str,
-    seq,
-    map
-  ]
-});
-
-function resolveYamlNull(data) {
-  if (data === null) return true;
-
-  var max = data.length;
-
-  return (max === 1 && data === '~') ||
-         (max === 4 && (data === 'null' || data === 'Null' || data === 'NULL'));
+  return seq;
 }
-
-function constructYamlNull() {
-  return null;
+var map;
+var hasRequiredMap;
+function requireMap() {
+  if (hasRequiredMap) return map;
+  hasRequiredMap = 1;
+  const Type2 = requireType();
+  map = new Type2("tag:yaml.org,2002:map", {
+    kind: "mapping",
+    construct: function(data) {
+      return data !== null ? data : {};
+    }
+  });
+  return map;
 }
-
-function isNull(object) {
-  return object === null;
+var failsafe;
+var hasRequiredFailsafe;
+function requireFailsafe() {
+  if (hasRequiredFailsafe) return failsafe;
+  hasRequiredFailsafe = 1;
+  const Schema2 = requireSchema();
+  failsafe = new Schema2({
+    explicit: [
+      requireStr(),
+      requireSeq(),
+      requireMap()
+    ]
+  });
+  return failsafe;
 }
-
-var _null = new type('tag:yaml.org,2002:null', {
-  kind: 'scalar',
-  resolve: resolveYamlNull,
-  construct: constructYamlNull,
-  predicate: isNull,
-  represent: {
-    canonical: function () { return '~';    },
-    lowercase: function () { return 'null'; },
-    uppercase: function () { return 'NULL'; },
-    camelcase: function () { return 'Null'; },
-    empty:     function () { return '';     }
-  },
-  defaultStyle: 'lowercase'
-});
-
-function resolveYamlBoolean(data) {
-  if (data === null) return false;
-
-  var max = data.length;
-
-  return (max === 4 && (data === 'true' || data === 'True' || data === 'TRUE')) ||
-         (max === 5 && (data === 'false' || data === 'False' || data === 'FALSE'));
-}
-
-function constructYamlBoolean(data) {
-  return data === 'true' ||
-         data === 'True' ||
-         data === 'TRUE';
-}
-
-function isBoolean(object) {
-  return Object.prototype.toString.call(object) === '[object Boolean]';
-}
-
-var bool = new type('tag:yaml.org,2002:bool', {
-  kind: 'scalar',
-  resolve: resolveYamlBoolean,
-  construct: constructYamlBoolean,
-  predicate: isBoolean,
-  represent: {
-    lowercase: function (object) { return object ? 'true' : 'false'; },
-    uppercase: function (object) { return object ? 'TRUE' : 'FALSE'; },
-    camelcase: function (object) { return object ? 'True' : 'False'; }
-  },
-  defaultStyle: 'lowercase'
-});
-
-function isHexCode(c) {
-  return ((0x30/* 0 */ <= c) && (c <= 0x39/* 9 */)) ||
-         ((0x41/* A */ <= c) && (c <= 0x46/* F */)) ||
-         ((0x61/* a */ <= c) && (c <= 0x66/* f */));
-}
-
-function isOctCode(c) {
-  return ((0x30/* 0 */ <= c) && (c <= 0x37/* 7 */));
-}
-
-function isDecCode(c) {
-  return ((0x30/* 0 */ <= c) && (c <= 0x39/* 9 */));
-}
-
-function resolveYamlInteger(data) {
-  if (data === null) return false;
-
-  var max = data.length,
-      index = 0,
-      hasDigits = false,
-      ch;
-
-  if (!max) return false;
-
-  ch = data[index];
-
-  // sign
-  if (ch === '-' || ch === '+') {
-    ch = data[++index];
+var _null;
+var hasRequired_null;
+function require_null() {
+  if (hasRequired_null) return _null;
+  hasRequired_null = 1;
+  const Type2 = requireType();
+  function resolveYamlNull(data) {
+    if (data === null) return true;
+    const max = data.length;
+    return max === 1 && data === "~" || max === 4 && (data === "null" || data === "Null" || data === "NULL");
   }
-
-  if (ch === '0') {
-    // 0
-    if (index + 1 === max) return true;
-    ch = data[++index];
-
-    // base 2, base 8, base 16
-
-    if (ch === 'b') {
-      // base 2
-      index++;
-
-      for (; index < max; index++) {
-        ch = data[index];
-        if (ch === '_') continue;
-        if (ch !== '0' && ch !== '1') return false;
-        hasDigits = true;
-      }
-      return hasDigits && ch !== '_';
-    }
-
-
-    if (ch === 'x') {
-      // base 16
-      index++;
-
-      for (; index < max; index++) {
-        ch = data[index];
-        if (ch === '_') continue;
-        if (!isHexCode(data.charCodeAt(index))) return false;
-        hasDigits = true;
-      }
-      return hasDigits && ch !== '_';
-    }
-
-
-    if (ch === 'o') {
-      // base 8
-      index++;
-
-      for (; index < max; index++) {
-        ch = data[index];
-        if (ch === '_') continue;
-        if (!isOctCode(data.charCodeAt(index))) return false;
-        hasDigits = true;
-      }
-      return hasDigits && ch !== '_';
-    }
+  function constructYamlNull() {
+    return null;
   }
-
-  // base 10 (except 0)
-
-  // value should not start with `_`;
-  if (ch === '_') return false;
-
-  for (; index < max; index++) {
-    ch = data[index];
-    if (ch === '_') continue;
-    if (!isDecCode(data.charCodeAt(index))) {
+  function isNull(object) {
+    return object === null;
+  }
+  _null = new Type2("tag:yaml.org,2002:null", {
+    kind: "scalar",
+    resolve: resolveYamlNull,
+    construct: constructYamlNull,
+    predicate: isNull,
+    represent: {
+      canonical: function() {
+        return "~";
+      },
+      lowercase: function() {
+        return "null";
+      },
+      uppercase: function() {
+        return "NULL";
+      },
+      camelcase: function() {
+        return "Null";
+      },
+      empty: function() {
+        return "";
+      }
+    },
+    defaultStyle: "lowercase"
+  });
+  return _null;
+}
+var bool;
+var hasRequiredBool;
+function requireBool() {
+  if (hasRequiredBool) return bool;
+  hasRequiredBool = 1;
+  const Type2 = requireType();
+  function resolveYamlBoolean(data) {
+    if (data === null) return false;
+    const max = data.length;
+    return max === 4 && (data === "true" || data === "True" || data === "TRUE") || max === 5 && (data === "false" || data === "False" || data === "FALSE");
+  }
+  function constructYamlBoolean(data) {
+    return data === "true" || data === "True" || data === "TRUE";
+  }
+  function isBoolean(object) {
+    return Object.prototype.toString.call(object) === "[object Boolean]";
+  }
+  bool = new Type2("tag:yaml.org,2002:bool", {
+    kind: "scalar",
+    resolve: resolveYamlBoolean,
+    construct: constructYamlBoolean,
+    predicate: isBoolean,
+    represent: {
+      lowercase: function(object) {
+        return object ? "true" : "false";
+      },
+      uppercase: function(object) {
+        return object ? "TRUE" : "FALSE";
+      },
+      camelcase: function(object) {
+        return object ? "True" : "False";
+      }
+    },
+    defaultStyle: "lowercase"
+  });
+  return bool;
+}
+var int;
+var hasRequiredInt;
+function requireInt() {
+  if (hasRequiredInt) return int;
+  hasRequiredInt = 1;
+  const common2 = requireCommon();
+  const Type2 = requireType();
+  function isHexCode(c) {
+    return c >= 48 && c <= 57 || c >= 65 && c <= 70 || c >= 97 && c <= 102;
+  }
+  function isOctCode(c) {
+    return c >= 48 && c <= 55;
+  }
+  function isDecCode(c) {
+    return c >= 48 && c <= 57;
+  }
+  function resolveYamlInteger(data) {
+    if (data === null) return false;
+    const max = data.length;
+    let index = 0;
+    let hasDigits = false;
+    if (!max) return false;
+    let ch = data[index];
+    if (ch === "-" || ch === "+") {
+      ch = data[++index];
+    }
+    if (ch === "0") {
+      if (index + 1 === max) return true;
+      ch = data[++index];
+      if (ch === "b") {
+        index++;
+        for (; index < max; index++) {
+          ch = data[index];
+          if (ch !== "0" && ch !== "1") return false;
+          hasDigits = true;
+        }
+        return hasDigits && isFinite(parseYamlInteger(data));
+      }
+      if (ch === "x") {
+        index++;
+        for (; index < max; index++) {
+          if (!isHexCode(data.charCodeAt(index))) return false;
+          hasDigits = true;
+        }
+        return hasDigits && isFinite(parseYamlInteger(data));
+      }
+      if (ch === "o") {
+        index++;
+        for (; index < max; index++) {
+          if (!isOctCode(data.charCodeAt(index))) return false;
+          hasDigits = true;
+        }
+        return hasDigits && isFinite(parseYamlInteger(data));
+      }
+    }
+    for (; index < max; index++) {
+      if (!isDecCode(data.charCodeAt(index))) {
+        return false;
+      }
+      hasDigits = true;
+    }
+    if (!hasDigits) return false;
+    return isFinite(parseYamlInteger(data));
+  }
+  function parseYamlInteger(data) {
+    let value = data;
+    let sign = 1;
+    let ch = value[0];
+    if (ch === "-" || ch === "+") {
+      if (ch === "-") sign = -1;
+      value = value.slice(1);
+      ch = value[0];
+    }
+    if (value === "0") return 0;
+    if (ch === "0") {
+      if (value[1] === "b") return sign * parseInt(value.slice(2), 2);
+      if (value[1] === "x") return sign * parseInt(value.slice(2), 16);
+      if (value[1] === "o") return sign * parseInt(value.slice(2), 8);
+    }
+    return sign * parseInt(value, 10);
+  }
+  function constructYamlInteger(data) {
+    return parseYamlInteger(data);
+  }
+  function isInteger(object) {
+    return Object.prototype.toString.call(object) === "[object Number]" && (object % 1 === 0 && !common2.isNegativeZero(object));
+  }
+  int = new Type2("tag:yaml.org,2002:int", {
+    kind: "scalar",
+    resolve: resolveYamlInteger,
+    construct: constructYamlInteger,
+    predicate: isInteger,
+    represent: {
+      binary: function(obj) {
+        return obj >= 0 ? "0b" + obj.toString(2) : "-0b" + obj.toString(2).slice(1);
+      },
+      octal: function(obj) {
+        return obj >= 0 ? "0o" + obj.toString(8) : "-0o" + obj.toString(8).slice(1);
+      },
+      decimal: function(obj) {
+        return obj.toString(10);
+      },
+      hexadecimal: function(obj) {
+        return obj >= 0 ? "0x" + obj.toString(16).toUpperCase() : "-0x" + obj.toString(16).toUpperCase().slice(1);
+      }
+    },
+    defaultStyle: "decimal",
+    styleAliases: {
+      binary: [2, "bin"],
+      octal: [8, "oct"],
+      decimal: [10, "dec"],
+      hexadecimal: [16, "hex"]
+    }
+  });
+  return int;
+}
+var float;
+var hasRequiredFloat;
+function requireFloat() {
+  if (hasRequiredFloat) return float;
+  hasRequiredFloat = 1;
+  const common2 = requireCommon();
+  const Type2 = requireType();
+  const YAML_FLOAT_PATTERN = new RegExp(
+    // 2.5e4, 2.5 and integers
+    "^(?:[-+]?(?:[0-9]+)(?:\\.[0-9]*)?(?:[eE][-+]?[0-9]+)?|\\.[0-9]+(?:[eE][-+]?[0-9]+)?|[-+]?\\.(?:inf|Inf|INF)|\\.(?:nan|NaN|NAN))$"
+  );
+  const YAML_FLOAT_SPECIAL_PATTERN = new RegExp(
+    "^(?:[-+]?\\.(?:inf|Inf|INF)|\\.(?:nan|NaN|NAN))$"
+  );
+  function resolveYamlFloat(data) {
+    if (data === null) return false;
+    if (!YAML_FLOAT_PATTERN.test(data)) {
       return false;
     }
-    hasDigits = true;
+    if (isFinite(parseFloat(data, 10))) {
+      return true;
+    }
+    return YAML_FLOAT_SPECIAL_PATTERN.test(data);
   }
-
-  // Should have digits and should not end with `_`
-  if (!hasDigits || ch === '_') return false;
-
-  return true;
+  function constructYamlFloat(data) {
+    let value = data.toLowerCase();
+    const sign = value[0] === "-" ? -1 : 1;
+    if ("+-".indexOf(value[0]) >= 0) {
+      value = value.slice(1);
+    }
+    if (value === ".inf") {
+      return sign === 1 ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
+    } else if (value === ".nan") {
+      return NaN;
+    }
+    return sign * parseFloat(value, 10);
+  }
+  const SCIENTIFIC_WITHOUT_DOT = /^[-+]?[0-9]+e/;
+  function representYamlFloat(object, style) {
+    if (isNaN(object)) {
+      switch (style) {
+        case "lowercase":
+          return ".nan";
+        case "uppercase":
+          return ".NAN";
+        case "camelcase":
+          return ".NaN";
+      }
+    } else if (Number.POSITIVE_INFINITY === object) {
+      switch (style) {
+        case "lowercase":
+          return ".inf";
+        case "uppercase":
+          return ".INF";
+        case "camelcase":
+          return ".Inf";
+      }
+    } else if (Number.NEGATIVE_INFINITY === object) {
+      switch (style) {
+        case "lowercase":
+          return "-.inf";
+        case "uppercase":
+          return "-.INF";
+        case "camelcase":
+          return "-.Inf";
+      }
+    } else if (common2.isNegativeZero(object)) {
+      return "-0.0";
+    }
+    const res = object.toString(10);
+    return SCIENTIFIC_WITHOUT_DOT.test(res) ? res.replace("e", ".e") : res;
+  }
+  function isFloat(object) {
+    return Object.prototype.toString.call(object) === "[object Number]" && (object % 1 !== 0 || common2.isNegativeZero(object));
+  }
+  float = new Type2("tag:yaml.org,2002:float", {
+    kind: "scalar",
+    resolve: resolveYamlFloat,
+    construct: constructYamlFloat,
+    predicate: isFloat,
+    represent: representYamlFloat,
+    defaultStyle: "lowercase"
+  });
+  return float;
 }
-
-function constructYamlInteger(data) {
-  var value = data, sign = 1, ch;
-
-  if (value.indexOf('_') !== -1) {
-    value = value.replace(/_/g, '');
-  }
-
-  ch = value[0];
-
-  if (ch === '-' || ch === '+') {
-    if (ch === '-') sign = -1;
-    value = value.slice(1);
-    ch = value[0];
-  }
-
-  if (value === '0') return 0;
-
-  if (ch === '0') {
-    if (value[1] === 'b') return sign * parseInt(value.slice(2), 2);
-    if (value[1] === 'x') return sign * parseInt(value.slice(2), 16);
-    if (value[1] === 'o') return sign * parseInt(value.slice(2), 8);
-  }
-
-  return sign * parseInt(value, 10);
+var json;
+var hasRequiredJson;
+function requireJson() {
+  if (hasRequiredJson) return json;
+  hasRequiredJson = 1;
+  json = requireFailsafe().extend({
+    implicit: [
+      require_null(),
+      requireBool(),
+      requireInt(),
+      requireFloat()
+    ]
+  });
+  return json;
 }
-
-function isInteger(object) {
-  return (Object.prototype.toString.call(object)) === '[object Number]' &&
-         (object % 1 === 0 && !common.isNegativeZero(object));
+var core;
+var hasRequiredCore;
+function requireCore() {
+  if (hasRequiredCore) return core;
+  hasRequiredCore = 1;
+  core = requireJson();
+  return core;
 }
-
-var int = new type('tag:yaml.org,2002:int', {
-  kind: 'scalar',
-  resolve: resolveYamlInteger,
-  construct: constructYamlInteger,
-  predicate: isInteger,
-  represent: {
-    binary:      function (obj) { return obj >= 0 ? '0b' + obj.toString(2) : '-0b' + obj.toString(2).slice(1); },
-    octal:       function (obj) { return obj >= 0 ? '0o'  + obj.toString(8) : '-0o'  + obj.toString(8).slice(1); },
-    decimal:     function (obj) { return obj.toString(10); },
-    /* eslint-disable max-len */
-    hexadecimal: function (obj) { return obj >= 0 ? '0x' + obj.toString(16).toUpperCase() :  '-0x' + obj.toString(16).toUpperCase().slice(1); }
-  },
-  defaultStyle: 'decimal',
-  styleAliases: {
-    binary:      [ 2,  'bin' ],
-    octal:       [ 8,  'oct' ],
-    decimal:     [ 10, 'dec' ],
-    hexadecimal: [ 16, 'hex' ]
-  }
-});
-
-var YAML_FLOAT_PATTERN = new RegExp(
-  // 2.5e4, 2.5 and integers
-  '^(?:[-+]?(?:[0-9][0-9_]*)(?:\\.[0-9_]*)?(?:[eE][-+]?[0-9]+)?' +
-  // .2e4, .2
-  // special case, seems not from spec
-  '|\\.[0-9_]+(?:[eE][-+]?[0-9]+)?' +
-  // .inf
-  '|[-+]?\\.(?:inf|Inf|INF)' +
-  // .nan
-  '|\\.(?:nan|NaN|NAN))$');
-
-function resolveYamlFloat(data) {
-  if (data === null) return false;
-
-  if (!YAML_FLOAT_PATTERN.test(data) ||
-      // Quick hack to not allow integers end with `_`
-      // Probably should update regexp & check speed
-      data[data.length - 1] === '_') {
+var timestamp;
+var hasRequiredTimestamp;
+function requireTimestamp() {
+  if (hasRequiredTimestamp) return timestamp;
+  hasRequiredTimestamp = 1;
+  const Type2 = requireType();
+  const YAML_DATE_REGEXP = new RegExp(
+    "^([0-9][0-9][0-9][0-9])-([0-9][0-9])-([0-9][0-9])$"
+  );
+  const YAML_TIMESTAMP_REGEXP = new RegExp(
+    "^([0-9][0-9][0-9][0-9])-([0-9][0-9]?)-([0-9][0-9]?)(?:[Tt]|[ \\t]+)([0-9][0-9]?):([0-9][0-9]):([0-9][0-9])(?:\\.([0-9]*))?(?:[ \\t]*(Z|([-+])([0-9][0-9]?)(?::([0-9][0-9]))?))?$"
+  );
+  function resolveYamlTimestamp(data) {
+    if (data === null) return false;
+    if (YAML_DATE_REGEXP.exec(data) !== null) return true;
+    if (YAML_TIMESTAMP_REGEXP.exec(data) !== null) return true;
     return false;
   }
-
-  return true;
-}
-
-function constructYamlFloat(data) {
-  var value, sign;
-
-  value  = data.replace(/_/g, '').toLowerCase();
-  sign   = value[0] === '-' ? -1 : 1;
-
-  if ('+-'.indexOf(value[0]) >= 0) {
-    value = value.slice(1);
-  }
-
-  if (value === '.inf') {
-    return (sign === 1) ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
-
-  } else if (value === '.nan') {
-    return NaN;
-  }
-  return sign * parseFloat(value, 10);
-}
-
-
-var SCIENTIFIC_WITHOUT_DOT = /^[-+]?[0-9]+e/;
-
-function representYamlFloat(object, style) {
-  var res;
-
-  if (isNaN(object)) {
-    switch (style) {
-      case 'lowercase': return '.nan';
-      case 'uppercase': return '.NAN';
-      case 'camelcase': return '.NaN';
+  function constructYamlTimestamp(data) {
+    let fraction = 0;
+    let delta = null;
+    let match = YAML_DATE_REGEXP.exec(data);
+    if (match === null) match = YAML_TIMESTAMP_REGEXP.exec(data);
+    if (match === null) throw new Error("Date resolve error");
+    const year = +match[1];
+    const month = +match[2] - 1;
+    const day = +match[3];
+    if (!match[4]) {
+      return new Date(Date.UTC(year, month, day));
     }
-  } else if (Number.POSITIVE_INFINITY === object) {
-    switch (style) {
-      case 'lowercase': return '.inf';
-      case 'uppercase': return '.INF';
-      case 'camelcase': return '.Inf';
-    }
-  } else if (Number.NEGATIVE_INFINITY === object) {
-    switch (style) {
-      case 'lowercase': return '-.inf';
-      case 'uppercase': return '-.INF';
-      case 'camelcase': return '-.Inf';
-    }
-  } else if (common.isNegativeZero(object)) {
-    return '-0.0';
-  }
-
-  res = object.toString(10);
-
-  // JS stringifier can build scientific format without dots: 5e-100,
-  // while YAML requres dot: 5.e-100. Fix it with simple hack
-
-  return SCIENTIFIC_WITHOUT_DOT.test(res) ? res.replace('e', '.e') : res;
-}
-
-function isFloat(object) {
-  return (Object.prototype.toString.call(object) === '[object Number]') &&
-         (object % 1 !== 0 || common.isNegativeZero(object));
-}
-
-var float = new type('tag:yaml.org,2002:float', {
-  kind: 'scalar',
-  resolve: resolveYamlFloat,
-  construct: constructYamlFloat,
-  predicate: isFloat,
-  represent: representYamlFloat,
-  defaultStyle: 'lowercase'
-});
-
-var json = failsafe.extend({
-  implicit: [
-    _null,
-    bool,
-    int,
-    float
-  ]
-});
-
-var core = json;
-
-var YAML_DATE_REGEXP = new RegExp(
-  '^([0-9][0-9][0-9][0-9])'          + // [1] year
-  '-([0-9][0-9])'                    + // [2] month
-  '-([0-9][0-9])$');                   // [3] day
-
-var YAML_TIMESTAMP_REGEXP = new RegExp(
-  '^([0-9][0-9][0-9][0-9])'          + // [1] year
-  '-([0-9][0-9]?)'                   + // [2] month
-  '-([0-9][0-9]?)'                   + // [3] day
-  '(?:[Tt]|[ \\t]+)'                 + // ...
-  '([0-9][0-9]?)'                    + // [4] hour
-  ':([0-9][0-9])'                    + // [5] minute
-  ':([0-9][0-9])'                    + // [6] second
-  '(?:\\.([0-9]*))?'                 + // [7] fraction
-  '(?:[ \\t]*(Z|([-+])([0-9][0-9]?)' + // [8] tz [9] tz_sign [10] tz_hour
-  '(?::([0-9][0-9]))?))?$');           // [11] tz_minute
-
-function resolveYamlTimestamp(data) {
-  if (data === null) return false;
-  if (YAML_DATE_REGEXP.exec(data) !== null) return true;
-  if (YAML_TIMESTAMP_REGEXP.exec(data) !== null) return true;
-  return false;
-}
-
-function constructYamlTimestamp(data) {
-  var match, year, month, day, hour, minute, second, fraction = 0,
-      delta = null, tz_hour, tz_minute, date;
-
-  match = YAML_DATE_REGEXP.exec(data);
-  if (match === null) match = YAML_TIMESTAMP_REGEXP.exec(data);
-
-  if (match === null) throw new Error('Date resolve error');
-
-  // match: [1] year [2] month [3] day
-
-  year = +(match[1]);
-  month = +(match[2]) - 1; // JS month starts with 0
-  day = +(match[3]);
-
-  if (!match[4]) { // no hour
-    return new Date(Date.UTC(year, month, day));
-  }
-
-  // match: [4] hour [5] minute [6] second [7] fraction
-
-  hour = +(match[4]);
-  minute = +(match[5]);
-  second = +(match[6]);
-
-  if (match[7]) {
-    fraction = match[7].slice(0, 3);
-    while (fraction.length < 3) { // milli-seconds
-      fraction += '0';
-    }
-    fraction = +fraction;
-  }
-
-  // match: [8] tz [9] tz_sign [10] tz_hour [11] tz_minute
-
-  if (match[9]) {
-    tz_hour = +(match[10]);
-    tz_minute = +(match[11] || 0);
-    delta = (tz_hour * 60 + tz_minute) * 60000; // delta in mili-seconds
-    if (match[9] === '-') delta = -delta;
-  }
-
-  date = new Date(Date.UTC(year, month, day, hour, minute, second, fraction));
-
-  if (delta) date.setTime(date.getTime() - delta);
-
-  return date;
-}
-
-function representYamlTimestamp(object /*, style*/) {
-  return object.toISOString();
-}
-
-var timestamp = new type('tag:yaml.org,2002:timestamp', {
-  kind: 'scalar',
-  resolve: resolveYamlTimestamp,
-  construct: constructYamlTimestamp,
-  instanceOf: Date,
-  represent: representYamlTimestamp
-});
-
-function resolveYamlMerge(data) {
-  return data === '<<' || data === null;
-}
-
-var merge = new type('tag:yaml.org,2002:merge', {
-  kind: 'scalar',
-  resolve: resolveYamlMerge
-});
-
-/*eslint-disable no-bitwise*/
-
-
-
-
-
-// [ 64, 65, 66 ] -> [ padding, CR, LF ]
-var BASE64_MAP = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r';
-
-
-function resolveYamlBinary(data) {
-  if (data === null) return false;
-
-  var code, idx, bitlen = 0, max = data.length, map = BASE64_MAP;
-
-  // Convert one by one.
-  for (idx = 0; idx < max; idx++) {
-    code = map.indexOf(data.charAt(idx));
-
-    // Skip CR/LF
-    if (code > 64) continue;
-
-    // Fail on illegal characters
-    if (code < 0) return false;
-
-    bitlen += 6;
-  }
-
-  // If there are any bits left, source was corrupted
-  return (bitlen % 8) === 0;
-}
-
-function constructYamlBinary(data) {
-  var idx, tailbits,
-      input = data.replace(/[\r\n=]/g, ''), // remove CR/LF & padding to simplify scan
-      max = input.length,
-      map = BASE64_MAP,
-      bits = 0,
-      result = [];
-
-  // Collect by 6*4 bits (3 bytes)
-
-  for (idx = 0; idx < max; idx++) {
-    if ((idx % 4 === 0) && idx) {
-      result.push((bits >> 16) & 0xFF);
-      result.push((bits >> 8) & 0xFF);
-      result.push(bits & 0xFF);
-    }
-
-    bits = (bits << 6) | map.indexOf(input.charAt(idx));
-  }
-
-  // Dump tail
-
-  tailbits = (max % 4) * 6;
-
-  if (tailbits === 0) {
-    result.push((bits >> 16) & 0xFF);
-    result.push((bits >> 8) & 0xFF);
-    result.push(bits & 0xFF);
-  } else if (tailbits === 18) {
-    result.push((bits >> 10) & 0xFF);
-    result.push((bits >> 2) & 0xFF);
-  } else if (tailbits === 12) {
-    result.push((bits >> 4) & 0xFF);
-  }
-
-  return new Uint8Array(result);
-}
-
-function representYamlBinary(object /*, style*/) {
-  var result = '', bits = 0, idx, tail,
-      max = object.length,
-      map = BASE64_MAP;
-
-  // Convert every three bytes to 4 ASCII characters.
-
-  for (idx = 0; idx < max; idx++) {
-    if ((idx % 3 === 0) && idx) {
-      result += map[(bits >> 18) & 0x3F];
-      result += map[(bits >> 12) & 0x3F];
-      result += map[(bits >> 6) & 0x3F];
-      result += map[bits & 0x3F];
-    }
-
-    bits = (bits << 8) + object[idx];
-  }
-
-  // Dump tail
-
-  tail = max % 3;
-
-  if (tail === 0) {
-    result += map[(bits >> 18) & 0x3F];
-    result += map[(bits >> 12) & 0x3F];
-    result += map[(bits >> 6) & 0x3F];
-    result += map[bits & 0x3F];
-  } else if (tail === 2) {
-    result += map[(bits >> 10) & 0x3F];
-    result += map[(bits >> 4) & 0x3F];
-    result += map[(bits << 2) & 0x3F];
-    result += map[64];
-  } else if (tail === 1) {
-    result += map[(bits >> 2) & 0x3F];
-    result += map[(bits << 4) & 0x3F];
-    result += map[64];
-    result += map[64];
-  }
-
-  return result;
-}
-
-function isBinary(obj) {
-  return Object.prototype.toString.call(obj) ===  '[object Uint8Array]';
-}
-
-var binary = new type('tag:yaml.org,2002:binary', {
-  kind: 'scalar',
-  resolve: resolveYamlBinary,
-  construct: constructYamlBinary,
-  predicate: isBinary,
-  represent: representYamlBinary
-});
-
-var _hasOwnProperty$3 = Object.prototype.hasOwnProperty;
-var _toString$2       = Object.prototype.toString;
-
-function resolveYamlOmap(data) {
-  if (data === null) return true;
-
-  var objectKeys = [], index, length, pair, pairKey, pairHasKey,
-      object = data;
-
-  for (index = 0, length = object.length; index < length; index += 1) {
-    pair = object[index];
-    pairHasKey = false;
-
-    if (_toString$2.call(pair) !== '[object Object]') return false;
-
-    for (pairKey in pair) {
-      if (_hasOwnProperty$3.call(pair, pairKey)) {
-        if (!pairHasKey) pairHasKey = true;
-        else return false;
+    const hour = +match[4];
+    const minute = +match[5];
+    const second = +match[6];
+    if (match[7]) {
+      fraction = match[7].slice(0, 3);
+      while (fraction.length < 3) {
+        fraction += "0";
       }
+      fraction = +fraction;
     }
-
-    if (!pairHasKey) return false;
-
-    if (objectKeys.indexOf(pairKey) === -1) objectKeys.push(pairKey);
-    else return false;
+    if (match[9]) {
+      const tzHour = +match[10];
+      const tzMinute = +(match[11] || 0);
+      delta = (tzHour * 60 + tzMinute) * 6e4;
+      if (match[9] === "-") delta = -delta;
+    }
+    const date = new Date(Date.UTC(year, month, day, hour, minute, second, fraction));
+    if (delta) date.setTime(date.getTime() - delta);
+    return date;
   }
-
-  return true;
-}
-
-function constructYamlOmap(data) {
-  return data !== null ? data : [];
-}
-
-var omap = new type('tag:yaml.org,2002:omap', {
-  kind: 'sequence',
-  resolve: resolveYamlOmap,
-  construct: constructYamlOmap
-});
-
-var _toString$1 = Object.prototype.toString;
-
-function resolveYamlPairs(data) {
-  if (data === null) return true;
-
-  var index, length, pair, keys, result,
-      object = data;
-
-  result = new Array(object.length);
-
-  for (index = 0, length = object.length; index < length; index += 1) {
-    pair = object[index];
-
-    if (_toString$1.call(pair) !== '[object Object]') return false;
-
-    keys = Object.keys(pair);
-
-    if (keys.length !== 1) return false;
-
-    result[index] = [ keys[0], pair[keys[0]] ];
+  function representYamlTimestamp(object) {
+    return object.toISOString();
   }
-
-  return true;
+  timestamp = new Type2("tag:yaml.org,2002:timestamp", {
+    kind: "scalar",
+    resolve: resolveYamlTimestamp,
+    construct: constructYamlTimestamp,
+    instanceOf: Date,
+    represent: representYamlTimestamp
+  });
+  return timestamp;
 }
-
-function constructYamlPairs(data) {
-  if (data === null) return [];
-
-  var index, length, pair, keys, result,
-      object = data;
-
-  result = new Array(object.length);
-
-  for (index = 0, length = object.length; index < length; index += 1) {
-    pair = object[index];
-
-    keys = Object.keys(pair);
-
-    result[index] = [ keys[0], pair[keys[0]] ];
+var merge;
+var hasRequiredMerge;
+function requireMerge() {
+  if (hasRequiredMerge) return merge;
+  hasRequiredMerge = 1;
+  const Type2 = requireType();
+  function resolveYamlMerge(data) {
+    return data === "<<" || data === null;
   }
-
-  return result;
+  merge = new Type2("tag:yaml.org,2002:merge", {
+    kind: "scalar",
+    resolve: resolveYamlMerge
+  });
+  return merge;
 }
-
-var pairs = new type('tag:yaml.org,2002:pairs', {
-  kind: 'sequence',
-  resolve: resolveYamlPairs,
-  construct: constructYamlPairs
-});
-
-var _hasOwnProperty$2 = Object.prototype.hasOwnProperty;
-
-function resolveYamlSet(data) {
-  if (data === null) return true;
-
-  var key, object = data;
-
-  for (key in object) {
-    if (_hasOwnProperty$2.call(object, key)) {
-      if (object[key] !== null) return false;
+var binary;
+var hasRequiredBinary;
+function requireBinary() {
+  if (hasRequiredBinary) return binary;
+  hasRequiredBinary = 1;
+  const Type2 = requireType();
+  const BASE64_MAP = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r";
+  function resolveYamlBinary(data) {
+    if (data === null) return false;
+    let bitlen = 0;
+    const max = data.length;
+    const map2 = BASE64_MAP;
+    for (let idx = 0; idx < max; idx++) {
+      const code = map2.indexOf(data.charAt(idx));
+      if (code > 64) continue;
+      if (code < 0) return false;
+      bitlen += 6;
     }
+    return bitlen % 8 === 0;
   }
-
-  return true;
-}
-
-function constructYamlSet(data) {
-  return data !== null ? data : {};
-}
-
-var set = new type('tag:yaml.org,2002:set', {
-  kind: 'mapping',
-  resolve: resolveYamlSet,
-  construct: constructYamlSet
-});
-
-var _default = core.extend({
-  implicit: [
-    timestamp,
-    merge
-  ],
-  explicit: [
-    binary,
-    omap,
-    pairs,
-    set
-  ]
-});
-
-/*eslint-disable max-len,no-use-before-define*/
-
-
-
-
-
-
-
-var _hasOwnProperty$1 = Object.prototype.hasOwnProperty;
-
-
-var CONTEXT_FLOW_IN   = 1;
-var CONTEXT_FLOW_OUT  = 2;
-var CONTEXT_BLOCK_IN  = 3;
-var CONTEXT_BLOCK_OUT = 4;
-
-
-var CHOMPING_CLIP  = 1;
-var CHOMPING_STRIP = 2;
-var CHOMPING_KEEP  = 3;
-
-
-var PATTERN_NON_PRINTABLE         = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/;
-var PATTERN_NON_ASCII_LINE_BREAKS = /[\x85\u2028\u2029]/;
-var PATTERN_FLOW_INDICATORS       = /[,\[\]\{\}]/;
-var PATTERN_TAG_HANDLE            = /^(?:!|!!|![a-z\-]+!)$/i;
-var PATTERN_TAG_URI               = /^(?:!|[^,\[\]\{\}])(?:%[0-9a-f]{2}|[0-9a-z\-#;\/\?:@&=\+\$,_\.!~\*'\(\)\[\]])*$/i;
-
-
-function _class(obj) { return Object.prototype.toString.call(obj); }
-
-function is_EOL(c) {
-  return (c === 0x0A/* LF */) || (c === 0x0D/* CR */);
-}
-
-function is_WHITE_SPACE(c) {
-  return (c === 0x09/* Tab */) || (c === 0x20/* Space */);
-}
-
-function is_WS_OR_EOL(c) {
-  return (c === 0x09/* Tab */) ||
-         (c === 0x20/* Space */) ||
-         (c === 0x0A/* LF */) ||
-         (c === 0x0D/* CR */);
-}
-
-function is_FLOW_INDICATOR(c) {
-  return c === 0x2C/* , */ ||
-         c === 0x5B/* [ */ ||
-         c === 0x5D/* ] */ ||
-         c === 0x7B/* { */ ||
-         c === 0x7D/* } */;
-}
-
-function fromHexCode(c) {
-  var lc;
-
-  if ((0x30/* 0 */ <= c) && (c <= 0x39/* 9 */)) {
-    return c - 0x30;
+  function constructYamlBinary(data) {
+    const input = data.replace(/[\r\n=]/g, "");
+    const max = input.length;
+    const map2 = BASE64_MAP;
+    let bits = 0;
+    const result = [];
+    for (let idx = 0; idx < max; idx++) {
+      if (idx % 4 === 0 && idx) {
+        result.push(bits >> 16 & 255);
+        result.push(bits >> 8 & 255);
+        result.push(bits & 255);
+      }
+      bits = bits << 6 | map2.indexOf(input.charAt(idx));
+    }
+    const tailbits = max % 4 * 6;
+    if (tailbits === 0) {
+      result.push(bits >> 16 & 255);
+      result.push(bits >> 8 & 255);
+      result.push(bits & 255);
+    } else if (tailbits === 18) {
+      result.push(bits >> 10 & 255);
+      result.push(bits >> 2 & 255);
+    } else if (tailbits === 12) {
+      result.push(bits >> 4 & 255);
+    }
+    return new Uint8Array(result);
   }
-
-  /*eslint-disable no-bitwise*/
-  lc = c | 0x20;
-
-  if ((0x61/* a */ <= lc) && (lc <= 0x66/* f */)) {
-    return lc - 0x61 + 10;
+  function representYamlBinary(object) {
+    let result = "";
+    let bits = 0;
+    const max = object.length;
+    const map2 = BASE64_MAP;
+    for (let idx = 0; idx < max; idx++) {
+      if (idx % 3 === 0 && idx) {
+        result += map2[bits >> 18 & 63];
+        result += map2[bits >> 12 & 63];
+        result += map2[bits >> 6 & 63];
+        result += map2[bits & 63];
+      }
+      bits = (bits << 8) + object[idx];
+    }
+    const tail = max % 3;
+    if (tail === 0) {
+      result += map2[bits >> 18 & 63];
+      result += map2[bits >> 12 & 63];
+      result += map2[bits >> 6 & 63];
+      result += map2[bits & 63];
+    } else if (tail === 2) {
+      result += map2[bits >> 10 & 63];
+      result += map2[bits >> 4 & 63];
+      result += map2[bits << 2 & 63];
+      result += map2[64];
+    } else if (tail === 1) {
+      result += map2[bits >> 2 & 63];
+      result += map2[bits << 4 & 63];
+      result += map2[64];
+      result += map2[64];
+    }
+    return result;
   }
-
-  return -1;
-}
-
-function escapedHexLen(c) {
-  if (c === 0x78/* x */) { return 2; }
-  if (c === 0x75/* u */) { return 4; }
-  if (c === 0x55/* U */) { return 8; }
-  return 0;
-}
-
-function fromDecimalCode(c) {
-  if ((0x30/* 0 */ <= c) && (c <= 0x39/* 9 */)) {
-    return c - 0x30;
+  function isBinary(obj) {
+    return Object.prototype.toString.call(obj) === "[object Uint8Array]";
   }
-
-  return -1;
+  binary = new Type2("tag:yaml.org,2002:binary", {
+    kind: "scalar",
+    resolve: resolveYamlBinary,
+    construct: constructYamlBinary,
+    predicate: isBinary,
+    represent: representYamlBinary
+  });
+  return binary;
 }
-
-function simpleEscapeSequence(c) {
-  /* eslint-disable indent */
-  return (c === 0x30/* 0 */) ? '\x00' :
-        (c === 0x61/* a */) ? '\x07' :
-        (c === 0x62/* b */) ? '\x08' :
-        (c === 0x74/* t */) ? '\x09' :
-        (c === 0x09/* Tab */) ? '\x09' :
-        (c === 0x6E/* n */) ? '\x0A' :
-        (c === 0x76/* v */) ? '\x0B' :
-        (c === 0x66/* f */) ? '\x0C' :
-        (c === 0x72/* r */) ? '\x0D' :
-        (c === 0x65/* e */) ? '\x1B' :
-        (c === 0x20/* Space */) ? ' ' :
-        (c === 0x22/* " */) ? '\x22' :
-        (c === 0x2F/* / */) ? '/' :
-        (c === 0x5C/* \ */) ? '\x5C' :
-        (c === 0x4E/* N */) ? '\x85' :
-        (c === 0x5F/* _ */) ? '\xA0' :
-        (c === 0x4C/* L */) ? '\u2028' :
-        (c === 0x50/* P */) ? '\u2029' : '';
-}
-
-function charFromCodepoint(c) {
-  if (c <= 0xFFFF) {
-    return String.fromCharCode(c);
-  }
-  // Encode UTF-16 surrogate pair
-  // https://en.wikipedia.org/wiki/UTF-16#Code_points_U.2B010000_to_U.2B10FFFF
-  return String.fromCharCode(
-    ((c - 0x010000) >> 10) + 0xD800,
-    ((c - 0x010000) & 0x03FF) + 0xDC00
-  );
-}
-
-// set a property of a literal object, while protecting against prototype pollution,
-// see https://github.com/nodeca/js-yaml/issues/164 for more details
-function setProperty(object, key, value) {
-  // used for this specific key only because Object.defineProperty is slow
-  if (key === '__proto__') {
-    Object.defineProperty(object, key, {
-      configurable: true,
-      enumerable: true,
-      writable: true,
-      value: value
-    });
-  } else {
-    object[key] = value;
-  }
-}
-
-var simpleEscapeCheck = new Array(256); // integer, for fast access
-var simpleEscapeMap = new Array(256);
-for (var i = 0; i < 256; i++) {
-  simpleEscapeCheck[i] = simpleEscapeSequence(i) ? 1 : 0;
-  simpleEscapeMap[i] = simpleEscapeSequence(i);
-}
-
-
-function State$1(input, options) {
-  this.input = input;
-
-  this.filename  = options['filename']  || null;
-  this.schema    = options['schema']    || _default;
-  this.onWarning = options['onWarning'] || null;
-  // (Hidden) Remove? makes the loader to expect YAML 1.1 documents
-  // if such documents have no explicit %YAML directive
-  this.legacy    = options['legacy']    || false;
-
-  this.json      = options['json']      || false;
-  this.listener  = options['listener']  || null;
-
-  this.implicitTypes = this.schema.compiledImplicit;
-  this.typeMap       = this.schema.compiledTypeMap;
-
-  this.length     = input.length;
-  this.position   = 0;
-  this.line       = 0;
-  this.lineStart  = 0;
-  this.lineIndent = 0;
-
-  // position of first leading tab in the current line,
-  // used to make sure there are no tabs in the indentation
-  this.firstTabInLine = -1;
-
-  this.documents = [];
-
-  /*
-  this.version;
-  this.checkLineBreaks;
-  this.tagMap;
-  this.anchorMap;
-  this.tag;
-  this.anchor;
-  this.kind;
-  this.result;*/
-
-}
-
-
-function generateError(state, message) {
-  var mark = {
-    name:     state.filename,
-    buffer:   state.input.slice(0, -1), // omit trailing \0
-    position: state.position,
-    line:     state.line,
-    column:   state.position - state.lineStart
-  };
-
-  mark.snippet = snippet(mark);
-
-  return new exception(message, mark);
-}
-
-function throwError(state, message) {
-  throw generateError(state, message);
-}
-
-function throwWarning(state, message) {
-  if (state.onWarning) {
-    state.onWarning.call(null, generateError(state, message));
-  }
-}
-
-
-var directiveHandlers = {
-
-  YAML: function handleYamlDirective(state, name, args) {
-
-    var match, major, minor;
-
-    if (state.version !== null) {
-      throwError(state, 'duplication of %YAML directive');
-    }
-
-    if (args.length !== 1) {
-      throwError(state, 'YAML directive accepts exactly one argument');
-    }
-
-    match = /^([0-9]+)\.([0-9]+)$/.exec(args[0]);
-
-    if (match === null) {
-      throwError(state, 'ill-formed argument of the YAML directive');
-    }
-
-    major = parseInt(match[1], 10);
-    minor = parseInt(match[2], 10);
-
-    if (major !== 1) {
-      throwError(state, 'unacceptable YAML version of the document');
-    }
-
-    state.version = args[0];
-    state.checkLineBreaks = (minor < 2);
-
-    if (minor !== 1 && minor !== 2) {
-      throwWarning(state, 'unsupported YAML version of the document');
-    }
-  },
-
-  TAG: function handleTagDirective(state, name, args) {
-
-    var handle, prefix;
-
-    if (args.length !== 2) {
-      throwError(state, 'TAG directive accepts exactly two arguments');
-    }
-
-    handle = args[0];
-    prefix = args[1];
-
-    if (!PATTERN_TAG_HANDLE.test(handle)) {
-      throwError(state, 'ill-formed tag handle (first argument) of the TAG directive');
-    }
-
-    if (_hasOwnProperty$1.call(state.tagMap, handle)) {
-      throwError(state, 'there is a previously declared suffix for "' + handle + '" tag handle');
-    }
-
-    if (!PATTERN_TAG_URI.test(prefix)) {
-      throwError(state, 'ill-formed tag prefix (second argument) of the TAG directive');
-    }
-
-    try {
-      prefix = decodeURIComponent(prefix);
-    } catch (err) {
-      throwError(state, 'tag prefix is malformed: ' + prefix);
-    }
-
-    state.tagMap[handle] = prefix;
-  }
-};
-
-
-function captureSegment(state, start, end, checkJson) {
-  var _position, _length, _character, _result;
-
-  if (start < end) {
-    _result = state.input.slice(start, end);
-
-    if (checkJson) {
-      for (_position = 0, _length = _result.length; _position < _length; _position += 1) {
-        _character = _result.charCodeAt(_position);
-        if (!(_character === 0x09 ||
-              (0x20 <= _character && _character <= 0x10FFFF))) {
-          throwError(state, 'expected valid JSON character');
+var omap;
+var hasRequiredOmap;
+function requireOmap() {
+  if (hasRequiredOmap) return omap;
+  hasRequiredOmap = 1;
+  const Type2 = requireType();
+  const _hasOwnProperty = Object.prototype.hasOwnProperty;
+  const _toString = Object.prototype.toString;
+  function resolveYamlOmap(data) {
+    if (data === null) return true;
+    const objectKeys = {};
+    const object = data;
+    for (let index = 0, length = object.length; index < length; index += 1) {
+      const pair = object[index];
+      let pairHasKey = false;
+      if (_toString.call(pair) !== "[object Object]") return false;
+      let pairKey;
+      for (pairKey in pair) {
+        if (_hasOwnProperty.call(pair, pairKey)) {
+          if (!pairHasKey) pairHasKey = true;
+          else return false;
         }
       }
-    } else if (PATTERN_NON_PRINTABLE.test(_result)) {
-      throwError(state, 'the stream contains non-printable characters');
+      if (!pairHasKey) return false;
+      if (_hasOwnProperty.call(objectKeys, pairKey)) return false;
+      Object.defineProperty(objectKeys, pairKey, { value: true });
     }
-
-    state.result += _result;
+    return true;
   }
+  function constructYamlOmap(data) {
+    return data !== null ? data : [];
+  }
+  omap = new Type2("tag:yaml.org,2002:omap", {
+    kind: "sequence",
+    resolve: resolveYamlOmap,
+    construct: constructYamlOmap
+  });
+  return omap;
 }
-
-function mergeMappings(state, destination, source, overridableKeys) {
-  var sourceKeys, key, index, quantity;
-
-  if (!common.isObject(source)) {
-    throwError(state, 'cannot merge mappings; the provided source object is unacceptable');
-  }
-
-  sourceKeys = Object.keys(source);
-
-  for (index = 0, quantity = sourceKeys.length; index < quantity; index += 1) {
-    key = sourceKeys[index];
-
-    if (!_hasOwnProperty$1.call(destination, key)) {
-      setProperty(destination, key, source[key]);
-      overridableKeys[key] = true;
+var pairs;
+var hasRequiredPairs;
+function requirePairs() {
+  if (hasRequiredPairs) return pairs;
+  hasRequiredPairs = 1;
+  const Type2 = requireType();
+  const _toString = Object.prototype.toString;
+  function resolveYamlPairs(data) {
+    if (data === null) return true;
+    const object = data;
+    const result = new Array(object.length);
+    for (let index = 0, length = object.length; index < length; index += 1) {
+      const pair = object[index];
+      if (_toString.call(pair) !== "[object Object]") return false;
+      const keys = Object.keys(pair);
+      if (keys.length !== 1) return false;
+      result[index] = [keys[0], pair[keys[0]]];
     }
+    return true;
   }
+  function constructYamlPairs(data) {
+    if (data === null) return [];
+    const object = data;
+    const result = new Array(object.length);
+    for (let index = 0, length = object.length; index < length; index += 1) {
+      const pair = object[index];
+      const keys = Object.keys(pair);
+      result[index] = [keys[0], pair[keys[0]]];
+    }
+    return result;
+  }
+  pairs = new Type2("tag:yaml.org,2002:pairs", {
+    kind: "sequence",
+    resolve: resolveYamlPairs,
+    construct: constructYamlPairs
+  });
+  return pairs;
 }
-
-function storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode,
-  startLine, startLineStart, startPos) {
-
-  var index, quantity;
-
-  // The output is a plain object here, so keys can only be strings.
-  // We need to convert keyNode to a string, but doing so can hang the process
-  // (deeply nested arrays that explode exponentially using aliases).
-  if (Array.isArray(keyNode)) {
-    keyNode = Array.prototype.slice.call(keyNode);
-
-    for (index = 0, quantity = keyNode.length; index < quantity; index += 1) {
-      if (Array.isArray(keyNode[index])) {
-        throwError(state, 'nested arrays are not supported inside keys');
+var set;
+var hasRequiredSet;
+function requireSet() {
+  if (hasRequiredSet) return set;
+  hasRequiredSet = 1;
+  const Type2 = requireType();
+  const _hasOwnProperty = Object.prototype.hasOwnProperty;
+  function resolveYamlSet(data) {
+    if (data === null) return true;
+    const object = data;
+    for (const key in object) {
+      if (_hasOwnProperty.call(object, key)) {
+        if (object[key] !== null) return false;
       }
-
-      if (typeof keyNode === 'object' && _class(keyNode[index]) === '[object Object]') {
-        keyNode[index] = '[object Object]';
+    }
+    return true;
+  }
+  function constructYamlSet(data) {
+    return data !== null ? data : {};
+  }
+  set = new Type2("tag:yaml.org,2002:set", {
+    kind: "mapping",
+    resolve: resolveYamlSet,
+    construct: constructYamlSet
+  });
+  return set;
+}
+var _default;
+var hasRequired_default;
+function require_default() {
+  if (hasRequired_default) return _default;
+  hasRequired_default = 1;
+  _default = requireCore().extend({
+    implicit: [
+      requireTimestamp(),
+      requireMerge()
+    ],
+    explicit: [
+      requireBinary(),
+      requireOmap(),
+      requirePairs(),
+      requireSet()
+    ]
+  });
+  return _default;
+}
+var hasRequiredLoader;
+function requireLoader() {
+  if (hasRequiredLoader) return loader;
+  hasRequiredLoader = 1;
+  const common2 = requireCommon();
+  const YAMLException2 = requireException();
+  const makeSnippet = requireSnippet();
+  const DEFAULT_SCHEMA2 = require_default();
+  const _hasOwnProperty = Object.prototype.hasOwnProperty;
+  const CONTEXT_FLOW_IN = 1;
+  const CONTEXT_FLOW_OUT = 2;
+  const CONTEXT_BLOCK_IN = 3;
+  const CONTEXT_BLOCK_OUT = 4;
+  const CHOMPING_CLIP = 1;
+  const CHOMPING_STRIP = 2;
+  const CHOMPING_KEEP = 3;
+  const PATTERN_NON_PRINTABLE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/;
+  const PATTERN_NON_ASCII_LINE_BREAKS = /[\x85\u2028\u2029]/;
+  const PATTERN_FLOW_INDICATORS = /[,\[\]{}]/;
+  const PATTERN_TAG_HANDLE = /^(?:!|!!|![0-9A-Za-z-]+!)$/;
+  const PATTERN_TAG_URI = /^(?:!|[^,\[\]{}])(?:%[0-9a-f]{2}|[0-9a-z\-#;/?:@&=+$,_.!~*'()\[\]])*$/i;
+  function _class(obj) {
+    return Object.prototype.toString.call(obj);
+  }
+  function isEol(c) {
+    return c === 10 || c === 13;
+  }
+  function isWhiteSpace(c) {
+    return c === 9 || c === 32;
+  }
+  function isWsOrEol(c) {
+    return c === 9 || c === 32 || c === 10 || c === 13;
+  }
+  function isFlowIndicator(c) {
+    return c === 44 || c === 91 || c === 93 || c === 123 || c === 125;
+  }
+  function fromHexCode(c) {
+    if (c >= 48 && c <= 57) {
+      return c - 48;
+    }
+    const lc = c | 32;
+    if (lc >= 97 && lc <= 102) {
+      return lc - 97 + 10;
+    }
+    return -1;
+  }
+  function escapedHexLen(c) {
+    if (c === 120) {
+      return 2;
+    }
+    if (c === 117) {
+      return 4;
+    }
+    if (c === 85) {
+      return 8;
+    }
+    return 0;
+  }
+  function fromDecimalCode(c) {
+    if (c >= 48 && c <= 57) {
+      return c - 48;
+    }
+    return -1;
+  }
+  function simpleEscapeSequence(c) {
+    switch (c) {
+      case 48:
+        return "\0";
+      case 97:
+        return "\x07";
+      case 98:
+        return "\b";
+      case 116:
+        return "	";
+      case 9:
+        return "	";
+      case 110:
+        return "\n";
+      case 118:
+        return "\v";
+      case 102:
+        return "\f";
+      case 114:
+        return "\r";
+      case 101:
+        return "\x1B";
+      case 32:
+        return " ";
+      case 34:
+        return '"';
+      case 47:
+        return "/";
+      case 92:
+        return "\\";
+      case 78:
+        return "";
+      case 95:
+        return " ";
+      case 76:
+        return "\u2028";
+      case 80:
+        return "\u2029";
+      default:
+        return "";
+    }
+  }
+  function charFromCodepoint(c) {
+    if (c <= 65535) {
+      return String.fromCharCode(c);
+    }
+    return String.fromCharCode(
+      (c - 65536 >> 10) + 55296,
+      (c - 65536 & 1023) + 56320
+    );
+  }
+  function setProperty(object, key, value) {
+    if (key === "__proto__") {
+      Object.defineProperty(object, key, {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value
+      });
+    } else {
+      object[key] = value;
+    }
+  }
+  const simpleEscapeCheck = new Array(256);
+  const simpleEscapeMap = new Array(256);
+  for (let i = 0; i < 256; i++) {
+    simpleEscapeCheck[i] = simpleEscapeSequence(i) ? 1 : 0;
+    simpleEscapeMap[i] = simpleEscapeSequence(i);
+  }
+  function State(input, options) {
+    this.input = input;
+    this.filename = options["filename"] || null;
+    this.schema = options["schema"] || DEFAULT_SCHEMA2;
+    this.onWarning = options["onWarning"] || null;
+    this.legacy = options["legacy"] || false;
+    this.json = options["json"] || false;
+    this.listener = options["listener"] || null;
+    this.maxDepth = typeof options["maxDepth"] === "number" ? options["maxDepth"] : 100;
+    this.maxTotalMergeKeys = typeof options["maxTotalMergeKeys"] === "number" ? options["maxTotalMergeKeys"] : 1e4;
+    this.implicitTypes = this.schema.compiledImplicit;
+    this.typeMap = this.schema.compiledTypeMap;
+    this.length = input.length;
+    this.position = 0;
+    this.line = 0;
+    this.lineStart = 0;
+    this.lineIndent = 0;
+    this.depth = 0;
+    this.totalMergeKeys = 0;
+    this.firstTabInLine = -1;
+    this.documents = [];
+    this.anchorMapTransactions = [];
+  }
+  function generateError(state, message) {
+    const mark = {
+      name: state.filename,
+      buffer: state.input.slice(0, -1),
+      // omit trailing \0
+      position: state.position,
+      line: state.line,
+      column: state.position - state.lineStart
+    };
+    mark.snippet = makeSnippet(mark);
+    return new YAMLException2(message, mark);
+  }
+  function throwError(state, message) {
+    throw generateError(state, message);
+  }
+  function throwWarning(state, message) {
+    if (state.onWarning) {
+      state.onWarning.call(null, generateError(state, message));
+    }
+  }
+  function storeAnchor(state, name, value) {
+    const transactions = state.anchorMapTransactions;
+    if (transactions.length !== 0) {
+      const transaction = transactions[transactions.length - 1];
+      if (!_hasOwnProperty.call(transaction, name)) {
+        transaction[name] = {
+          existed: _hasOwnProperty.call(state.anchorMap, name),
+          value: state.anchorMap[name]
+        };
+      }
+    }
+    state.anchorMap[name] = value;
+  }
+  function beginAnchorTransaction(state) {
+    state.anchorMapTransactions.push(/* @__PURE__ */ Object.create(null));
+  }
+  function commitAnchorTransaction(state) {
+    const transaction = state.anchorMapTransactions.pop();
+    const transactions = state.anchorMapTransactions;
+    if (transactions.length === 0) return;
+    const parent = transactions[transactions.length - 1];
+    const names = Object.keys(transaction);
+    for (let index = 0, length = names.length; index < length; index += 1) {
+      const name = names[index];
+      if (!_hasOwnProperty.call(parent, name)) {
+        parent[name] = transaction[name];
       }
     }
   }
-
-  // Avoid code execution in load() via toString property
-  // (still use its own toString for arrays, timestamps,
-  // and whatever user schema extensions happen to have @@toStringTag)
-  if (typeof keyNode === 'object' && _class(keyNode) === '[object Object]') {
-    keyNode = '[object Object]';
+  function rollbackAnchorTransaction(state) {
+    const transaction = state.anchorMapTransactions.pop();
+    const names = Object.keys(transaction);
+    for (let index = names.length - 1; index >= 0; index -= 1) {
+      const entry = transaction[names[index]];
+      if (entry.existed) {
+        state.anchorMap[names[index]] = entry.value;
+      } else {
+        delete state.anchorMap[names[index]];
+      }
+    }
   }
-
-
-  keyNode = String(keyNode);
-
-  if (_result === null) {
-    _result = {};
+  function snapshotState(state) {
+    return {
+      position: state.position,
+      line: state.line,
+      lineStart: state.lineStart,
+      lineIndent: state.lineIndent,
+      firstTabInLine: state.firstTabInLine,
+      tag: state.tag,
+      anchor: state.anchor,
+      kind: state.kind,
+      result: state.result
+    };
   }
-
-  if (keyTag === 'tag:yaml.org,2002:merge') {
-    if (Array.isArray(valueNode)) {
-      for (index = 0, quantity = valueNode.length; index < quantity; index += 1) {
-        mergeMappings(state, _result, valueNode[index], overridableKeys);
+  function restoreState(state, snapshot) {
+    state.position = snapshot.position;
+    state.line = snapshot.line;
+    state.lineStart = snapshot.lineStart;
+    state.lineIndent = snapshot.lineIndent;
+    state.firstTabInLine = snapshot.firstTabInLine;
+    state.tag = snapshot.tag;
+    state.anchor = snapshot.anchor;
+    state.kind = snapshot.kind;
+    state.result = snapshot.result;
+  }
+  const directiveHandlers = {
+    YAML: function handleYamlDirective(state, name, args) {
+      if (state.version !== null) {
+        throwError(state, "duplication of %YAML directive");
+      }
+      if (args.length !== 1) {
+        throwError(state, "YAML directive accepts exactly one argument");
+      }
+      const match = /^([0-9]+)\.([0-9]+)$/.exec(args[0]);
+      if (match === null) {
+        throwError(state, "ill-formed argument of the YAML directive");
+      }
+      const major = parseInt(match[1], 10);
+      const minor = parseInt(match[2], 10);
+      if (major !== 1) {
+        throwError(state, "unacceptable YAML version of the document");
+      }
+      state.version = args[0];
+      state.checkLineBreaks = minor < 2;
+      if (minor !== 1 && minor !== 2) {
+        throwWarning(state, "unsupported YAML version of the document");
+      }
+    },
+    TAG: function handleTagDirective(state, name, args) {
+      let prefix;
+      if (args.length !== 2) {
+        throwError(state, "TAG directive accepts exactly two arguments");
+      }
+      const handle = args[0];
+      prefix = args[1];
+      if (!PATTERN_TAG_HANDLE.test(handle)) {
+        throwError(state, "ill-formed tag handle (first argument) of the TAG directive");
+      }
+      if (_hasOwnProperty.call(state.tagMap, handle)) {
+        throwError(state, 'there is a previously declared suffix for "' + handle + '" tag handle');
+      }
+      if (!PATTERN_TAG_URI.test(prefix)) {
+        throwError(state, "ill-formed tag prefix (second argument) of the TAG directive");
+      }
+      try {
+        prefix = decodeURIComponent(prefix);
+      } catch (err) {
+        throwError(state, "tag prefix is malformed: " + prefix);
+      }
+      state.tagMap[handle] = prefix;
+    }
+  };
+  function captureSegment(state, start, end, checkJson) {
+    if (start < end) {
+      const _result = state.input.slice(start, end);
+      if (checkJson) {
+        for (let _position = 0, _length = _result.length; _position < _length; _position += 1) {
+          const _character = _result.charCodeAt(_position);
+          if (!(_character === 9 || _character >= 32 && _character <= 1114111)) {
+            throwError(state, "expected valid JSON character");
+          }
+        }
+      } else if (PATTERN_NON_PRINTABLE.test(_result)) {
+        throwError(state, "the stream contains non-printable characters");
+      }
+      state.result += _result;
+    }
+  }
+  function mergeMappings(state, destination, source, overridableKeys) {
+    if (!common2.isObject(source)) {
+      throwError(state, "cannot merge mappings; the provided source object is unacceptable");
+    }
+    const sourceKeys = Object.keys(source);
+    for (let index = 0, quantity = sourceKeys.length; index < quantity; index += 1) {
+      const key = sourceKeys[index];
+      if (state.maxTotalMergeKeys !== -1 && ++state.totalMergeKeys > state.maxTotalMergeKeys) {
+        throwError(state, "merge keys exceeded maxTotalMergeKeys (" + state.maxTotalMergeKeys + ")");
+      }
+      if (!_hasOwnProperty.call(destination, key)) {
+        setProperty(destination, key, source[key]);
+        overridableKeys[key] = true;
+      }
+    }
+  }
+  function storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode, startLine, startLineStart, startPos) {
+    if (Array.isArray(keyNode)) {
+      keyNode = Array.prototype.slice.call(keyNode);
+      for (let index = 0, quantity = keyNode.length; index < quantity; index += 1) {
+        if (Array.isArray(keyNode[index])) {
+          throwError(state, "nested arrays are not supported inside keys");
+        }
+        if (typeof keyNode === "object" && _class(keyNode[index]) === "[object Object]") {
+          keyNode[index] = "[object Object]";
+        }
+      }
+    }
+    if (typeof keyNode === "object" && _class(keyNode) === "[object Object]") {
+      keyNode = "[object Object]";
+    }
+    keyNode = String(keyNode);
+    if (_result === null) {
+      _result = {};
+    }
+    if (keyTag === "tag:yaml.org,2002:merge") {
+      if (Array.isArray(valueNode)) {
+        for (let index = 0, quantity = valueNode.length; index < quantity; index += 1) {
+          mergeMappings(state, _result, valueNode[index], overridableKeys);
+        }
+      } else {
+        mergeMappings(state, _result, valueNode, overridableKeys);
       }
     } else {
-      mergeMappings(state, _result, valueNode, overridableKeys);
+      if (!state.json && !_hasOwnProperty.call(overridableKeys, keyNode) && _hasOwnProperty.call(_result, keyNode)) {
+        state.line = startLine || state.line;
+        state.lineStart = startLineStart || state.lineStart;
+        state.position = startPos || state.position;
+        throwError(state, "duplicated mapping key");
+      }
+      setProperty(_result, keyNode, valueNode);
+      delete overridableKeys[keyNode];
     }
-  } else {
-    if (!state.json &&
-        !_hasOwnProperty$1.call(overridableKeys, keyNode) &&
-        _hasOwnProperty$1.call(_result, keyNode)) {
-      state.line = startLine || state.line;
-      state.lineStart = startLineStart || state.lineStart;
-      state.position = startPos || state.position;
-      throwError(state, 'duplicated mapping key');
-    }
-
-    setProperty(_result, keyNode, valueNode);
-    delete overridableKeys[keyNode];
+    return _result;
   }
-
-  return _result;
-}
-
-function readLineBreak(state) {
-  var ch;
-
-  ch = state.input.charCodeAt(state.position);
-
-  if (ch === 0x0A/* LF */) {
-    state.position++;
-  } else if (ch === 0x0D/* CR */) {
-    state.position++;
-    if (state.input.charCodeAt(state.position) === 0x0A/* LF */) {
+  function readLineBreak(state) {
+    const ch = state.input.charCodeAt(state.position);
+    if (ch === 10) {
       state.position++;
+    } else if (ch === 13) {
+      state.position++;
+      if (state.input.charCodeAt(state.position) === 10) {
+        state.position++;
+      }
+    } else {
+      throwError(state, "a line break is expected");
     }
-  } else {
-    throwError(state, 'a line break is expected');
+    state.line += 1;
+    state.lineStart = state.position;
+    state.firstTabInLine = -1;
   }
-
-  state.line += 1;
-  state.lineStart = state.position;
-  state.firstTabInLine = -1;
-}
-
-function skipSeparationSpace(state, allowComments, checkIndent) {
-  var lineBreaks = 0,
-      ch = state.input.charCodeAt(state.position);
-
-  while (ch !== 0) {
-    while (is_WHITE_SPACE(ch)) {
-      if (ch === 0x09/* Tab */ && state.firstTabInLine === -1) {
-        state.firstTabInLine = state.position;
+  function skipSeparationSpace(state, allowComments, checkIndent) {
+    let lineBreaks = 0;
+    let ch = state.input.charCodeAt(state.position);
+    while (ch !== 0) {
+      while (isWhiteSpace(ch)) {
+        if (ch === 9 && state.firstTabInLine === -1) {
+          state.firstTabInLine = state.position;
+        }
+        ch = state.input.charCodeAt(++state.position);
+      }
+      if (allowComments && ch === 35) {
+        do {
+          ch = state.input.charCodeAt(++state.position);
+        } while (ch !== 10 && ch !== 13 && ch !== 0);
+      }
+      if (isEol(ch)) {
+        readLineBreak(state);
+        ch = state.input.charCodeAt(state.position);
+        lineBreaks++;
+        state.lineIndent = 0;
+        while (ch === 32) {
+          state.lineIndent++;
+          ch = state.input.charCodeAt(++state.position);
+        }
+      } else {
+        break;
+      }
+    }
+    if (checkIndent !== -1 && lineBreaks !== 0 && state.lineIndent < checkIndent) {
+      throwWarning(state, "deficient indentation");
+    }
+    return lineBreaks;
+  }
+  function testDocumentSeparator(state) {
+    let _position = state.position;
+    let ch = state.input.charCodeAt(_position);
+    if ((ch === 45 || ch === 46) && ch === state.input.charCodeAt(_position + 1) && ch === state.input.charCodeAt(_position + 2)) {
+      _position += 3;
+      ch = state.input.charCodeAt(_position);
+      if (ch === 0 || isWsOrEol(ch)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  function writeFoldedLines(state, count) {
+    if (count === 1) {
+      state.result += " ";
+    } else if (count > 1) {
+      state.result += common2.repeat("\n", count - 1);
+    }
+  }
+  function readPlainScalar(state, nodeIndent, withinFlowCollection) {
+    let captureStart;
+    let captureEnd;
+    let hasPendingContent;
+    let _line;
+    let _lineStart;
+    let _lineIndent;
+    const _kind = state.kind;
+    const _result = state.result;
+    let ch = state.input.charCodeAt(state.position);
+    if (isWsOrEol(ch) || isFlowIndicator(ch) || ch === 35 || ch === 38 || ch === 42 || ch === 33 || ch === 124 || ch === 62 || ch === 39 || ch === 34 || ch === 37 || ch === 64 || ch === 96) {
+      return false;
+    }
+    if (ch === 63 || ch === 45) {
+      const following = state.input.charCodeAt(state.position + 1);
+      if (isWsOrEol(following) || withinFlowCollection && isFlowIndicator(following)) {
+        return false;
+      }
+    }
+    state.kind = "scalar";
+    state.result = "";
+    captureStart = captureEnd = state.position;
+    hasPendingContent = false;
+    while (ch !== 0) {
+      if (ch === 58) {
+        const following = state.input.charCodeAt(state.position + 1);
+        if (isWsOrEol(following) || withinFlowCollection && isFlowIndicator(following)) {
+          break;
+        }
+      } else if (ch === 35) {
+        const preceding = state.input.charCodeAt(state.position - 1);
+        if (isWsOrEol(preceding)) {
+          break;
+        }
+      } else if (state.position === state.lineStart && testDocumentSeparator(state) || withinFlowCollection && isFlowIndicator(ch)) {
+        break;
+      } else if (isEol(ch)) {
+        _line = state.line;
+        _lineStart = state.lineStart;
+        _lineIndent = state.lineIndent;
+        skipSeparationSpace(state, false, -1);
+        if (state.lineIndent >= nodeIndent) {
+          hasPendingContent = true;
+          ch = state.input.charCodeAt(state.position);
+          continue;
+        } else {
+          state.position = captureEnd;
+          state.line = _line;
+          state.lineStart = _lineStart;
+          state.lineIndent = _lineIndent;
+          break;
+        }
+      }
+      if (hasPendingContent) {
+        captureSegment(state, captureStart, captureEnd, false);
+        writeFoldedLines(state, state.line - _line);
+        captureStart = captureEnd = state.position;
+        hasPendingContent = false;
+      }
+      if (!isWhiteSpace(ch)) {
+        captureEnd = state.position + 1;
       }
       ch = state.input.charCodeAt(++state.position);
     }
-
-    if (allowComments && ch === 0x23/* # */) {
+    captureSegment(state, captureStart, captureEnd, false);
+    if (state.result) {
+      return true;
+    }
+    state.kind = _kind;
+    state.result = _result;
+    return false;
+  }
+  function readSingleQuotedScalar(state, nodeIndent) {
+    let captureStart;
+    let captureEnd;
+    let ch = state.input.charCodeAt(state.position);
+    if (ch !== 39) {
+      return false;
+    }
+    state.kind = "scalar";
+    state.result = "";
+    state.position++;
+    captureStart = captureEnd = state.position;
+    while ((ch = state.input.charCodeAt(state.position)) !== 0) {
+      if (ch === 39) {
+        captureSegment(state, captureStart, state.position, true);
+        ch = state.input.charCodeAt(++state.position);
+        if (ch === 39) {
+          captureStart = state.position;
+          state.position++;
+          captureEnd = state.position;
+        } else {
+          return true;
+        }
+      } else if (isEol(ch)) {
+        captureSegment(state, captureStart, captureEnd, true);
+        writeFoldedLines(state, skipSeparationSpace(state, false, nodeIndent));
+        captureStart = captureEnd = state.position;
+      } else if (state.position === state.lineStart && testDocumentSeparator(state)) {
+        throwError(state, "unexpected end of the document within a single quoted scalar");
+      } else {
+        state.position++;
+        if (!isWhiteSpace(ch)) {
+          captureEnd = state.position;
+        }
+      }
+    }
+    throwError(state, "unexpected end of the stream within a single quoted scalar");
+  }
+  function readDoubleQuotedScalar(state, nodeIndent) {
+    let captureStart;
+    let captureEnd;
+    let tmp;
+    let ch = state.input.charCodeAt(state.position);
+    if (ch !== 34) {
+      return false;
+    }
+    state.kind = "scalar";
+    state.result = "";
+    state.position++;
+    captureStart = captureEnd = state.position;
+    while ((ch = state.input.charCodeAt(state.position)) !== 0) {
+      if (ch === 34) {
+        captureSegment(state, captureStart, state.position, true);
+        state.position++;
+        return true;
+      } else if (ch === 92) {
+        captureSegment(state, captureStart, state.position, true);
+        ch = state.input.charCodeAt(++state.position);
+        if (isEol(ch)) {
+          skipSeparationSpace(state, false, nodeIndent);
+        } else if (ch < 256 && simpleEscapeCheck[ch]) {
+          state.result += simpleEscapeMap[ch];
+          state.position++;
+        } else if ((tmp = escapedHexLen(ch)) > 0) {
+          let hexLength = tmp;
+          let hexResult = 0;
+          for (; hexLength > 0; hexLength--) {
+            ch = state.input.charCodeAt(++state.position);
+            if ((tmp = fromHexCode(ch)) >= 0) {
+              hexResult = (hexResult << 4) + tmp;
+            } else {
+              throwError(state, "expected hexadecimal character");
+            }
+          }
+          state.result += charFromCodepoint(hexResult);
+          state.position++;
+        } else {
+          throwError(state, "unknown escape sequence");
+        }
+        captureStart = captureEnd = state.position;
+      } else if (isEol(ch)) {
+        captureSegment(state, captureStart, captureEnd, true);
+        writeFoldedLines(state, skipSeparationSpace(state, false, nodeIndent));
+        captureStart = captureEnd = state.position;
+      } else if (state.position === state.lineStart && testDocumentSeparator(state)) {
+        throwError(state, "unexpected end of the document within a double quoted scalar");
+      } else {
+        state.position++;
+        if (!isWhiteSpace(ch)) {
+          captureEnd = state.position;
+        }
+      }
+    }
+    throwError(state, "unexpected end of the stream within a double quoted scalar");
+  }
+  function readFlowCollection(state, nodeIndent) {
+    let readNext = true;
+    let _line;
+    let _lineStart;
+    let _pos;
+    const _tag = state.tag;
+    let _result;
+    const _anchor = state.anchor;
+    let terminator;
+    let isPair;
+    let isExplicitPair;
+    let isMapping;
+    const overridableKeys = /* @__PURE__ */ Object.create(null);
+    let keyNode;
+    let keyTag;
+    let valueNode;
+    let ch = state.input.charCodeAt(state.position);
+    if (ch === 91) {
+      terminator = 93;
+      isMapping = false;
+      _result = [];
+    } else if (ch === 123) {
+      terminator = 125;
+      isMapping = true;
+      _result = {};
+    } else {
+      return false;
+    }
+    if (state.anchor !== null) {
+      storeAnchor(state, state.anchor, _result);
+    }
+    ch = state.input.charCodeAt(++state.position);
+    while (ch !== 0) {
+      skipSeparationSpace(state, true, nodeIndent);
+      ch = state.input.charCodeAt(state.position);
+      if (ch === terminator) {
+        state.position++;
+        state.tag = _tag;
+        state.anchor = _anchor;
+        state.kind = isMapping ? "mapping" : "sequence";
+        state.result = _result;
+        return true;
+      } else if (!readNext) {
+        throwError(state, "missed comma between flow collection entries");
+      } else if (ch === 44) {
+        throwError(state, "expected the node content, but found ','");
+      }
+      keyTag = keyNode = valueNode = null;
+      isPair = isExplicitPair = false;
+      if (ch === 63) {
+        const following = state.input.charCodeAt(state.position + 1);
+        if (isWsOrEol(following)) {
+          isPair = isExplicitPair = true;
+          state.position++;
+          skipSeparationSpace(state, true, nodeIndent);
+        }
+      }
+      _line = state.line;
+      _lineStart = state.lineStart;
+      _pos = state.position;
+      composeNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true);
+      keyTag = state.tag;
+      keyNode = state.result;
+      skipSeparationSpace(state, true, nodeIndent);
+      ch = state.input.charCodeAt(state.position);
+      if ((isExplicitPair || state.line === _line) && ch === 58) {
+        isPair = true;
+        ch = state.input.charCodeAt(++state.position);
+        skipSeparationSpace(state, true, nodeIndent);
+        composeNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true);
+        valueNode = state.result;
+      }
+      if (isMapping) {
+        storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode, _line, _lineStart, _pos);
+      } else if (isPair) {
+        _result.push(storeMappingPair(state, null, overridableKeys, keyTag, keyNode, valueNode, _line, _lineStart, _pos));
+      } else {
+        _result.push(keyNode);
+      }
+      skipSeparationSpace(state, true, nodeIndent);
+      ch = state.input.charCodeAt(state.position);
+      if (ch === 44) {
+        readNext = true;
+        ch = state.input.charCodeAt(++state.position);
+      } else {
+        readNext = false;
+      }
+    }
+    throwError(state, "unexpected end of the stream within a flow collection");
+  }
+  function readBlockScalar(state, nodeIndent) {
+    let folding;
+    let chomping = CHOMPING_CLIP;
+    let didReadContent = false;
+    let detectedIndent = false;
+    let textIndent = nodeIndent;
+    let emptyLines = 0;
+    let atMoreIndented = false;
+    let tmp;
+    let ch = state.input.charCodeAt(state.position);
+    if (ch === 124) {
+      folding = false;
+    } else if (ch === 62) {
+      folding = true;
+    } else {
+      return false;
+    }
+    state.kind = "scalar";
+    state.result = "";
+    while (ch !== 0) {
+      ch = state.input.charCodeAt(++state.position);
+      if (ch === 43 || ch === 45) {
+        if (CHOMPING_CLIP === chomping) {
+          chomping = ch === 43 ? CHOMPING_KEEP : CHOMPING_STRIP;
+        } else {
+          throwError(state, "repeat of a chomping mode identifier");
+        }
+      } else if ((tmp = fromDecimalCode(ch)) >= 0) {
+        if (tmp === 0) {
+          throwError(state, "bad explicit indentation width of a block scalar; it cannot be less than one");
+        } else if (!detectedIndent) {
+          textIndent = nodeIndent + tmp - 1;
+          detectedIndent = true;
+        } else {
+          throwError(state, "repeat of an indentation width identifier");
+        }
+      } else {
+        break;
+      }
+    }
+    if (isWhiteSpace(ch)) {
       do {
         ch = state.input.charCodeAt(++state.position);
-      } while (ch !== 0x0A/* LF */ && ch !== 0x0D/* CR */ && ch !== 0);
+      } while (isWhiteSpace(ch));
+      if (ch === 35) {
+        do {
+          ch = state.input.charCodeAt(++state.position);
+        } while (!isEol(ch) && ch !== 0);
+      }
     }
-
-    if (is_EOL(ch)) {
+    while (ch !== 0) {
       readLineBreak(state);
-
-      ch = state.input.charCodeAt(state.position);
-      lineBreaks++;
       state.lineIndent = 0;
-
-      while (ch === 0x20/* Space */) {
+      ch = state.input.charCodeAt(state.position);
+      while ((!detectedIndent || state.lineIndent < textIndent) && ch === 32) {
         state.lineIndent++;
         ch = state.input.charCodeAt(++state.position);
       }
-    } else {
-      break;
-    }
-  }
-
-  if (checkIndent !== -1 && lineBreaks !== 0 && state.lineIndent < checkIndent) {
-    throwWarning(state, 'deficient indentation');
-  }
-
-  return lineBreaks;
-}
-
-function testDocumentSeparator(state) {
-  var _position = state.position,
-      ch;
-
-  ch = state.input.charCodeAt(_position);
-
-  // Condition state.position === state.lineStart is tested
-  // in parent on each call, for efficiency. No needs to test here again.
-  if ((ch === 0x2D/* - */ || ch === 0x2E/* . */) &&
-      ch === state.input.charCodeAt(_position + 1) &&
-      ch === state.input.charCodeAt(_position + 2)) {
-
-    _position += 3;
-
-    ch = state.input.charCodeAt(_position);
-
-    if (ch === 0 || is_WS_OR_EOL(ch)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function writeFoldedLines(state, count) {
-  if (count === 1) {
-    state.result += ' ';
-  } else if (count > 1) {
-    state.result += common.repeat('\n', count - 1);
-  }
-}
-
-
-function readPlainScalar(state, nodeIndent, withinFlowCollection) {
-  var preceding,
-      following,
-      captureStart,
-      captureEnd,
-      hasPendingContent,
-      _line,
-      _lineStart,
-      _lineIndent,
-      _kind = state.kind,
-      _result = state.result,
-      ch;
-
-  ch = state.input.charCodeAt(state.position);
-
-  if (is_WS_OR_EOL(ch)      ||
-      is_FLOW_INDICATOR(ch) ||
-      ch === 0x23/* # */    ||
-      ch === 0x26/* & */    ||
-      ch === 0x2A/* * */    ||
-      ch === 0x21/* ! */    ||
-      ch === 0x7C/* | */    ||
-      ch === 0x3E/* > */    ||
-      ch === 0x27/* ' */    ||
-      ch === 0x22/* " */    ||
-      ch === 0x25/* % */    ||
-      ch === 0x40/* @ */    ||
-      ch === 0x60/* ` */) {
-    return false;
-  }
-
-  if (ch === 0x3F/* ? */ || ch === 0x2D/* - */) {
-    following = state.input.charCodeAt(state.position + 1);
-
-    if (is_WS_OR_EOL(following) ||
-        withinFlowCollection && is_FLOW_INDICATOR(following)) {
-      return false;
-    }
-  }
-
-  state.kind = 'scalar';
-  state.result = '';
-  captureStart = captureEnd = state.position;
-  hasPendingContent = false;
-
-  while (ch !== 0) {
-    if (ch === 0x3A/* : */) {
-      following = state.input.charCodeAt(state.position + 1);
-
-      if (is_WS_OR_EOL(following) ||
-          withinFlowCollection && is_FLOW_INDICATOR(following)) {
-        break;
+      if (!detectedIndent && state.lineIndent > textIndent) {
+        textIndent = state.lineIndent;
       }
-
-    } else if (ch === 0x23/* # */) {
-      preceding = state.input.charCodeAt(state.position - 1);
-
-      if (is_WS_OR_EOL(preceding)) {
-        break;
-      }
-
-    } else if ((state.position === state.lineStart && testDocumentSeparator(state)) ||
-               withinFlowCollection && is_FLOW_INDICATOR(ch)) {
-      break;
-
-    } else if (is_EOL(ch)) {
-      _line = state.line;
-      _lineStart = state.lineStart;
-      _lineIndent = state.lineIndent;
-      skipSeparationSpace(state, false, -1);
-
-      if (state.lineIndent >= nodeIndent) {
-        hasPendingContent = true;
-        ch = state.input.charCodeAt(state.position);
+      if (isEol(ch)) {
+        emptyLines++;
         continue;
-      } else {
-        state.position = captureEnd;
-        state.line = _line;
-        state.lineStart = _lineStart;
-        state.lineIndent = _lineIndent;
-        break;
       }
-    }
-
-    if (hasPendingContent) {
-      captureSegment(state, captureStart, captureEnd, false);
-      writeFoldedLines(state, state.line - _line);
-      captureStart = captureEnd = state.position;
-      hasPendingContent = false;
-    }
-
-    if (!is_WHITE_SPACE(ch)) {
-      captureEnd = state.position + 1;
-    }
-
-    ch = state.input.charCodeAt(++state.position);
-  }
-
-  captureSegment(state, captureStart, captureEnd, false);
-
-  if (state.result) {
-    return true;
-  }
-
-  state.kind = _kind;
-  state.result = _result;
-  return false;
-}
-
-function readSingleQuotedScalar(state, nodeIndent) {
-  var ch,
-      captureStart, captureEnd;
-
-  ch = state.input.charCodeAt(state.position);
-
-  if (ch !== 0x27/* ' */) {
-    return false;
-  }
-
-  state.kind = 'scalar';
-  state.result = '';
-  state.position++;
-  captureStart = captureEnd = state.position;
-
-  while ((ch = state.input.charCodeAt(state.position)) !== 0) {
-    if (ch === 0x27/* ' */) {
-      captureSegment(state, captureStart, state.position, true);
-      ch = state.input.charCodeAt(++state.position);
-
-      if (ch === 0x27/* ' */) {
-        captureStart = state.position;
-        state.position++;
-        captureEnd = state.position;
-      } else {
-        return true;
+      if (!detectedIndent && textIndent === 0) {
+        throwError(state, "missing indentation for block scalar");
       }
-
-    } else if (is_EOL(ch)) {
-      captureSegment(state, captureStart, captureEnd, true);
-      writeFoldedLines(state, skipSeparationSpace(state, false, nodeIndent));
-      captureStart = captureEnd = state.position;
-
-    } else if (state.position === state.lineStart && testDocumentSeparator(state)) {
-      throwError(state, 'unexpected end of the document within a single quoted scalar');
-
-    } else {
-      state.position++;
-      captureEnd = state.position;
-    }
-  }
-
-  throwError(state, 'unexpected end of the stream within a single quoted scalar');
-}
-
-function readDoubleQuotedScalar(state, nodeIndent) {
-  var captureStart,
-      captureEnd,
-      hexLength,
-      hexResult,
-      tmp,
-      ch;
-
-  ch = state.input.charCodeAt(state.position);
-
-  if (ch !== 0x22/* " */) {
-    return false;
-  }
-
-  state.kind = 'scalar';
-  state.result = '';
-  state.position++;
-  captureStart = captureEnd = state.position;
-
-  while ((ch = state.input.charCodeAt(state.position)) !== 0) {
-    if (ch === 0x22/* " */) {
-      captureSegment(state, captureStart, state.position, true);
-      state.position++;
-      return true;
-
-    } else if (ch === 0x5C/* \ */) {
-      captureSegment(state, captureStart, state.position, true);
-      ch = state.input.charCodeAt(++state.position);
-
-      if (is_EOL(ch)) {
-        skipSeparationSpace(state, false, nodeIndent);
-
-        // TODO: rework to inline fn with no type cast?
-      } else if (ch < 256 && simpleEscapeCheck[ch]) {
-        state.result += simpleEscapeMap[ch];
-        state.position++;
-
-      } else if ((tmp = escapedHexLen(ch)) > 0) {
-        hexLength = tmp;
-        hexResult = 0;
-
-        for (; hexLength > 0; hexLength--) {
-          ch = state.input.charCodeAt(++state.position);
-
-          if ((tmp = fromHexCode(ch)) >= 0) {
-            hexResult = (hexResult << 4) + tmp;
-
-          } else {
-            throwError(state, 'expected hexadecimal character');
+      if (state.lineIndent < textIndent) {
+        if (chomping === CHOMPING_KEEP) {
+          state.result += common2.repeat("\n", didReadContent ? 1 + emptyLines : emptyLines);
+        } else if (chomping === CHOMPING_CLIP) {
+          if (didReadContent) {
+            state.result += "\n";
           }
         }
-
-        state.result += charFromCodepoint(hexResult);
-
-        state.position++;
-
-      } else {
-        throwError(state, 'unknown escape sequence');
+        break;
       }
-
-      captureStart = captureEnd = state.position;
-
-    } else if (is_EOL(ch)) {
-      captureSegment(state, captureStart, captureEnd, true);
-      writeFoldedLines(state, skipSeparationSpace(state, false, nodeIndent));
-      captureStart = captureEnd = state.position;
-
-    } else if (state.position === state.lineStart && testDocumentSeparator(state)) {
-      throwError(state, 'unexpected end of the document within a double quoted scalar');
-
-    } else {
-      state.position++;
-      captureEnd = state.position;
+      if (folding) {
+        if (isWhiteSpace(ch)) {
+          atMoreIndented = true;
+          state.result += common2.repeat("\n", didReadContent ? 1 + emptyLines : emptyLines);
+        } else if (atMoreIndented) {
+          atMoreIndented = false;
+          state.result += common2.repeat("\n", emptyLines + 1);
+        } else if (emptyLines === 0) {
+          if (didReadContent) {
+            state.result += " ";
+          }
+        } else {
+          state.result += common2.repeat("\n", emptyLines);
+        }
+      } else {
+        state.result += common2.repeat("\n", didReadContent ? 1 + emptyLines : emptyLines);
+      }
+      didReadContent = true;
+      detectedIndent = true;
+      emptyLines = 0;
+      const captureStart = state.position;
+      while (!isEol(ch) && ch !== 0) {
+        ch = state.input.charCodeAt(++state.position);
+      }
+      captureSegment(state, captureStart, state.position, false);
     }
+    return true;
   }
-
-  throwError(state, 'unexpected end of the stream within a double quoted scalar');
-}
-
-function readFlowCollection(state, nodeIndent) {
-  var readNext = true,
-      _line,
-      _lineStart,
-      _pos,
-      _tag     = state.tag,
-      _result,
-      _anchor  = state.anchor,
-      following,
-      terminator,
-      isPair,
-      isExplicitPair,
-      isMapping,
-      overridableKeys = Object.create(null),
-      keyNode,
-      keyTag,
-      valueNode,
-      ch;
-
-  ch = state.input.charCodeAt(state.position);
-
-  if (ch === 0x5B/* [ */) {
-    terminator = 0x5D;/* ] */
-    isMapping = false;
-    _result = [];
-  } else if (ch === 0x7B/* { */) {
-    terminator = 0x7D;/* } */
-    isMapping = true;
-    _result = {};
-  } else {
-    return false;
-  }
-
-  if (state.anchor !== null) {
-    state.anchorMap[state.anchor] = _result;
-  }
-
-  ch = state.input.charCodeAt(++state.position);
-
-  while (ch !== 0) {
-    skipSeparationSpace(state, true, nodeIndent);
-
-    ch = state.input.charCodeAt(state.position);
-
-    if (ch === terminator) {
+  function readBlockSequence(state, nodeIndent) {
+    const _tag = state.tag;
+    const _anchor = state.anchor;
+    const _result = [];
+    let detected = false;
+    if (state.firstTabInLine !== -1) return false;
+    if (state.anchor !== null) {
+      storeAnchor(state, state.anchor, _result);
+    }
+    let ch = state.input.charCodeAt(state.position);
+    while (ch !== 0) {
+      if (state.firstTabInLine !== -1) {
+        state.position = state.firstTabInLine;
+        throwError(state, "tab characters must not be used in indentation");
+      }
+      if (ch !== 45) {
+        break;
+      }
+      const following = state.input.charCodeAt(state.position + 1);
+      if (!isWsOrEol(following)) {
+        break;
+      }
+      detected = true;
       state.position++;
+      if (skipSeparationSpace(state, true, -1)) {
+        if (state.lineIndent <= nodeIndent) {
+          _result.push(null);
+          ch = state.input.charCodeAt(state.position);
+          continue;
+        }
+      }
+      const _line = state.line;
+      composeNode(state, nodeIndent, CONTEXT_BLOCK_IN, false, true);
+      _result.push(state.result);
+      skipSeparationSpace(state, true, -1);
+      ch = state.input.charCodeAt(state.position);
+      if ((state.line === _line || state.lineIndent > nodeIndent) && ch !== 0) {
+        throwError(state, "bad indentation of a sequence entry");
+      } else if (state.lineIndent < nodeIndent) {
+        break;
+      }
+    }
+    if (detected) {
       state.tag = _tag;
       state.anchor = _anchor;
-      state.kind = isMapping ? 'mapping' : 'sequence';
+      state.kind = "sequence";
       state.result = _result;
       return true;
-    } else if (!readNext) {
-      throwError(state, 'missed comma between flow collection entries');
-    } else if (ch === 0x2C/* , */) {
-      // "flow collection entries can never be completely empty", as per YAML 1.2, section 7.4
-      throwError(state, "expected the node content, but found ','");
     }
-
-    keyTag = keyNode = valueNode = null;
-    isPair = isExplicitPair = false;
-
-    if (ch === 0x3F/* ? */) {
-      following = state.input.charCodeAt(state.position + 1);
-
-      if (is_WS_OR_EOL(following)) {
-        isPair = isExplicitPair = true;
-        state.position++;
-        skipSeparationSpace(state, true, nodeIndent);
-      }
-    }
-
-    _line = state.line; // Save the current line.
-    _lineStart = state.lineStart;
-    _pos = state.position;
-    composeNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true);
-    keyTag = state.tag;
-    keyNode = state.result;
-    skipSeparationSpace(state, true, nodeIndent);
-
-    ch = state.input.charCodeAt(state.position);
-
-    if ((isExplicitPair || state.line === _line) && ch === 0x3A/* : */) {
-      isPair = true;
-      ch = state.input.charCodeAt(++state.position);
-      skipSeparationSpace(state, true, nodeIndent);
-      composeNode(state, nodeIndent, CONTEXT_FLOW_IN, false, true);
-      valueNode = state.result;
-    }
-
-    if (isMapping) {
-      storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode, _line, _lineStart, _pos);
-    } else if (isPair) {
-      _result.push(storeMappingPair(state, null, overridableKeys, keyTag, keyNode, valueNode, _line, _lineStart, _pos));
-    } else {
-      _result.push(keyNode);
-    }
-
-    skipSeparationSpace(state, true, nodeIndent);
-
-    ch = state.input.charCodeAt(state.position);
-
-    if (ch === 0x2C/* , */) {
-      readNext = true;
-      ch = state.input.charCodeAt(++state.position);
-    } else {
-      readNext = false;
-    }
-  }
-
-  throwError(state, 'unexpected end of the stream within a flow collection');
-}
-
-function readBlockScalar(state, nodeIndent) {
-  var captureStart,
-      folding,
-      chomping       = CHOMPING_CLIP,
-      didReadContent = false,
-      detectedIndent = false,
-      textIndent     = nodeIndent,
-      emptyLines     = 0,
-      atMoreIndented = false,
-      tmp,
-      ch;
-
-  ch = state.input.charCodeAt(state.position);
-
-  if (ch === 0x7C/* | */) {
-    folding = false;
-  } else if (ch === 0x3E/* > */) {
-    folding = true;
-  } else {
     return false;
   }
-
-  state.kind = 'scalar';
-  state.result = '';
-
-  while (ch !== 0) {
-    ch = state.input.charCodeAt(++state.position);
-
-    if (ch === 0x2B/* + */ || ch === 0x2D/* - */) {
-      if (CHOMPING_CLIP === chomping) {
-        chomping = (ch === 0x2B/* + */) ? CHOMPING_KEEP : CHOMPING_STRIP;
-      } else {
-        throwError(state, 'repeat of a chomping mode identifier');
+  function readBlockMapping(state, nodeIndent, flowIndent) {
+    let allowCompact;
+    let _keyLine;
+    let _keyLineStart;
+    let _keyPos;
+    const _tag = state.tag;
+    const _anchor = state.anchor;
+    const _result = {};
+    const overridableKeys = /* @__PURE__ */ Object.create(null);
+    let keyTag = null;
+    let keyNode = null;
+    let valueNode = null;
+    let atExplicitKey = false;
+    let detected = false;
+    if (state.firstTabInLine !== -1) return false;
+    if (state.anchor !== null) {
+      storeAnchor(state, state.anchor, _result);
+    }
+    let ch = state.input.charCodeAt(state.position);
+    while (ch !== 0) {
+      if (!atExplicitKey && state.firstTabInLine !== -1) {
+        state.position = state.firstTabInLine;
+        throwError(state, "tab characters must not be used in indentation");
       }
-
-    } else if ((tmp = fromDecimalCode(ch)) >= 0) {
-      if (tmp === 0) {
-        throwError(state, 'bad explicit indentation width of a block scalar; it cannot be less than one');
-      } else if (!detectedIndent) {
-        textIndent = nodeIndent + tmp - 1;
-        detectedIndent = true;
-      } else {
-        throwError(state, 'repeat of an indentation width identifier');
-      }
-
-    } else {
-      break;
-    }
-  }
-
-  if (is_WHITE_SPACE(ch)) {
-    do { ch = state.input.charCodeAt(++state.position); }
-    while (is_WHITE_SPACE(ch));
-
-    if (ch === 0x23/* # */) {
-      do { ch = state.input.charCodeAt(++state.position); }
-      while (!is_EOL(ch) && (ch !== 0));
-    }
-  }
-
-  while (ch !== 0) {
-    readLineBreak(state);
-    state.lineIndent = 0;
-
-    ch = state.input.charCodeAt(state.position);
-
-    while ((!detectedIndent || state.lineIndent < textIndent) &&
-           (ch === 0x20/* Space */)) {
-      state.lineIndent++;
-      ch = state.input.charCodeAt(++state.position);
-    }
-
-    if (!detectedIndent && state.lineIndent > textIndent) {
-      textIndent = state.lineIndent;
-    }
-
-    if (is_EOL(ch)) {
-      emptyLines++;
-      continue;
-    }
-
-    // End of the scalar.
-    if (state.lineIndent < textIndent) {
-
-      // Perform the chomping.
-      if (chomping === CHOMPING_KEEP) {
-        state.result += common.repeat('\n', didReadContent ? 1 + emptyLines : emptyLines);
-      } else if (chomping === CHOMPING_CLIP) {
-        if (didReadContent) { // i.e. only if the scalar is not empty.
-          state.result += '\n';
-        }
-      }
-
-      // Break this `while` cycle and go to the funciton's epilogue.
-      break;
-    }
-
-    // Folded style: use fancy rules to handle line breaks.
-    if (folding) {
-
-      // Lines starting with white space characters (more-indented lines) are not folded.
-      if (is_WHITE_SPACE(ch)) {
-        atMoreIndented = true;
-        // except for the first content line (cf. Example 8.1)
-        state.result += common.repeat('\n', didReadContent ? 1 + emptyLines : emptyLines);
-
-      // End of more-indented block.
-      } else if (atMoreIndented) {
-        atMoreIndented = false;
-        state.result += common.repeat('\n', emptyLines + 1);
-
-      // Just one line break - perceive as the same line.
-      } else if (emptyLines === 0) {
-        if (didReadContent) { // i.e. only if we have already read some scalar content.
-          state.result += ' ';
-        }
-
-      // Several line breaks - perceive as different lines.
-      } else {
-        state.result += common.repeat('\n', emptyLines);
-      }
-
-    // Literal style: just add exact number of line breaks between content lines.
-    } else {
-      // Keep all line breaks except the header line break.
-      state.result += common.repeat('\n', didReadContent ? 1 + emptyLines : emptyLines);
-    }
-
-    didReadContent = true;
-    detectedIndent = true;
-    emptyLines = 0;
-    captureStart = state.position;
-
-    while (!is_EOL(ch) && (ch !== 0)) {
-      ch = state.input.charCodeAt(++state.position);
-    }
-
-    captureSegment(state, captureStart, state.position, false);
-  }
-
-  return true;
-}
-
-function readBlockSequence(state, nodeIndent) {
-  var _line,
-      _tag      = state.tag,
-      _anchor   = state.anchor,
-      _result   = [],
-      following,
-      detected  = false,
-      ch;
-
-  // there is a leading tab before this token, so it can't be a block sequence/mapping;
-  // it can still be flow sequence/mapping or a scalar
-  if (state.firstTabInLine !== -1) return false;
-
-  if (state.anchor !== null) {
-    state.anchorMap[state.anchor] = _result;
-  }
-
-  ch = state.input.charCodeAt(state.position);
-
-  while (ch !== 0) {
-    if (state.firstTabInLine !== -1) {
-      state.position = state.firstTabInLine;
-      throwError(state, 'tab characters must not be used in indentation');
-    }
-
-    if (ch !== 0x2D/* - */) {
-      break;
-    }
-
-    following = state.input.charCodeAt(state.position + 1);
-
-    if (!is_WS_OR_EOL(following)) {
-      break;
-    }
-
-    detected = true;
-    state.position++;
-
-    if (skipSeparationSpace(state, true, -1)) {
-      if (state.lineIndent <= nodeIndent) {
-        _result.push(null);
-        ch = state.input.charCodeAt(state.position);
-        continue;
-      }
-    }
-
-    _line = state.line;
-    composeNode(state, nodeIndent, CONTEXT_BLOCK_IN, false, true);
-    _result.push(state.result);
-    skipSeparationSpace(state, true, -1);
-
-    ch = state.input.charCodeAt(state.position);
-
-    if ((state.line === _line || state.lineIndent > nodeIndent) && (ch !== 0)) {
-      throwError(state, 'bad indentation of a sequence entry');
-    } else if (state.lineIndent < nodeIndent) {
-      break;
-    }
-  }
-
-  if (detected) {
-    state.tag = _tag;
-    state.anchor = _anchor;
-    state.kind = 'sequence';
-    state.result = _result;
-    return true;
-  }
-  return false;
-}
-
-function readBlockMapping(state, nodeIndent, flowIndent) {
-  var following,
-      allowCompact,
-      _line,
-      _keyLine,
-      _keyLineStart,
-      _keyPos,
-      _tag          = state.tag,
-      _anchor       = state.anchor,
-      _result       = {},
-      overridableKeys = Object.create(null),
-      keyTag        = null,
-      keyNode       = null,
-      valueNode     = null,
-      atExplicitKey = false,
-      detected      = false,
-      ch;
-
-  // there is a leading tab before this token, so it can't be a block sequence/mapping;
-  // it can still be flow sequence/mapping or a scalar
-  if (state.firstTabInLine !== -1) return false;
-
-  if (state.anchor !== null) {
-    state.anchorMap[state.anchor] = _result;
-  }
-
-  ch = state.input.charCodeAt(state.position);
-
-  while (ch !== 0) {
-    if (!atExplicitKey && state.firstTabInLine !== -1) {
-      state.position = state.firstTabInLine;
-      throwError(state, 'tab characters must not be used in indentation');
-    }
-
-    following = state.input.charCodeAt(state.position + 1);
-    _line = state.line; // Save the current line.
-
-    //
-    // Explicit notation case. There are two separate blocks:
-    // first for the key (denoted by "?") and second for the value (denoted by ":")
-    //
-    if ((ch === 0x3F/* ? */ || ch === 0x3A/* : */) && is_WS_OR_EOL(following)) {
-
-      if (ch === 0x3F/* ? */) {
-        if (atExplicitKey) {
-          storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos);
-          keyTag = keyNode = valueNode = null;
-        }
-
-        detected = true;
-        atExplicitKey = true;
-        allowCompact = true;
-
-      } else if (atExplicitKey) {
-        // i.e. 0x3A/* : */ === character after the explicit key.
-        atExplicitKey = false;
-        allowCompact = true;
-
-      } else {
-        throwError(state, 'incomplete explicit mapping pair; a key node is missed; or followed by a non-tabulated empty line');
-      }
-
-      state.position += 1;
-      ch = following;
-
-    //
-    // Implicit notation case. Flow-style node as the key first, then ":", and the value.
-    //
-    } else {
-      _keyLine = state.line;
-      _keyLineStart = state.lineStart;
-      _keyPos = state.position;
-
-      if (!composeNode(state, flowIndent, CONTEXT_FLOW_OUT, false, true)) {
-        // Neither implicit nor explicit notation.
-        // Reading is done. Go to the epilogue.
-        break;
-      }
-
-      if (state.line === _line) {
-        ch = state.input.charCodeAt(state.position);
-
-        while (is_WHITE_SPACE(ch)) {
-          ch = state.input.charCodeAt(++state.position);
-        }
-
-        if (ch === 0x3A/* : */) {
-          ch = state.input.charCodeAt(++state.position);
-
-          if (!is_WS_OR_EOL(ch)) {
-            throwError(state, 'a whitespace character is expected after the key-value separator within a block mapping');
-          }
-
+      const following = state.input.charCodeAt(state.position + 1);
+      const _line = state.line;
+      if ((ch === 63 || ch === 58) && isWsOrEol(following)) {
+        if (ch === 63) {
           if (atExplicitKey) {
             storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos);
             keyTag = keyNode = valueNode = null;
           }
-
           detected = true;
+          atExplicitKey = true;
+          allowCompact = true;
+        } else if (atExplicitKey) {
           atExplicitKey = false;
-          allowCompact = false;
-          keyTag = state.tag;
-          keyNode = state.result;
-
-        } else if (detected) {
-          throwError(state, 'can not read an implicit mapping pair; a colon is missed');
-
+          allowCompact = true;
         } else {
-          state.tag = _tag;
-          state.anchor = _anchor;
-          return true; // Keep the result of `composeNode`.
+          throwError(state, "incomplete explicit mapping pair; a key node is missed; or followed by a non-tabulated empty line");
         }
-
-      } else if (detected) {
-        throwError(state, 'can not read a block mapping entry; a multiline key may not be an implicit key');
-
+        state.position += 1;
+        ch = following;
       } else {
-        state.tag = _tag;
-        state.anchor = _anchor;
-        return true; // Keep the result of `composeNode`.
-      }
-    }
-
-    //
-    // Common reading code for both explicit and implicit notations.
-    //
-    if (state.line === _line || state.lineIndent > nodeIndent) {
-      if (atExplicitKey) {
         _keyLine = state.line;
         _keyLineStart = state.lineStart;
         _keyPos = state.position;
-      }
-
-      if (composeNode(state, nodeIndent, CONTEXT_BLOCK_OUT, true, allowCompact)) {
-        if (atExplicitKey) {
-          keyNode = state.result;
+        if (!composeNode(state, flowIndent, CONTEXT_FLOW_OUT, false, true)) {
+          break;
+        }
+        if (state.line === _line) {
+          ch = state.input.charCodeAt(state.position);
+          while (isWhiteSpace(ch)) {
+            ch = state.input.charCodeAt(++state.position);
+          }
+          if (ch === 58) {
+            ch = state.input.charCodeAt(++state.position);
+            if (!isWsOrEol(ch)) {
+              throwError(state, "a whitespace character is expected after the key-value separator within a block mapping");
+            }
+            if (atExplicitKey) {
+              storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos);
+              keyTag = keyNode = valueNode = null;
+            }
+            detected = true;
+            atExplicitKey = false;
+            allowCompact = false;
+            keyTag = state.tag;
+            keyNode = state.result;
+          } else if (detected) {
+            throwError(state, "can not read an implicit mapping pair; a colon is missed");
+          } else {
+            state.tag = _tag;
+            state.anchor = _anchor;
+            return true;
+          }
+        } else if (detected) {
+          throwError(state, "can not read a block mapping entry; a multiline key may not be an implicit key");
         } else {
-          valueNode = state.result;
+          state.tag = _tag;
+          state.anchor = _anchor;
+          return true;
         }
       }
-
-      if (!atExplicitKey) {
-        storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode, _keyLine, _keyLineStart, _keyPos);
-        keyTag = keyNode = valueNode = null;
+      if (state.line === _line || state.lineIndent > nodeIndent) {
+        if (atExplicitKey) {
+          _keyLine = state.line;
+          _keyLineStart = state.lineStart;
+          _keyPos = state.position;
+        }
+        if (composeNode(state, nodeIndent, CONTEXT_BLOCK_OUT, true, allowCompact)) {
+          if (atExplicitKey) {
+            keyNode = state.result;
+          } else {
+            valueNode = state.result;
+          }
+        }
+        if (!atExplicitKey) {
+          storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, valueNode, _keyLine, _keyLineStart, _keyPos);
+          keyTag = keyNode = valueNode = null;
+        }
+        skipSeparationSpace(state, true, -1);
+        ch = state.input.charCodeAt(state.position);
       }
-
-      skipSeparationSpace(state, true, -1);
-      ch = state.input.charCodeAt(state.position);
+      if ((state.line === _line || state.lineIndent > nodeIndent) && ch !== 0) {
+        throwError(state, "bad indentation of a mapping entry");
+      } else if (state.lineIndent < nodeIndent) {
+        break;
+      }
     }
-
-    if ((state.line === _line || state.lineIndent > nodeIndent) && (ch !== 0)) {
-      throwError(state, 'bad indentation of a mapping entry');
-    } else if (state.lineIndent < nodeIndent) {
-      break;
+    if (atExplicitKey) {
+      storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos);
     }
+    if (detected) {
+      state.tag = _tag;
+      state.anchor = _anchor;
+      state.kind = "mapping";
+      state.result = _result;
+    }
+    return detected;
   }
-
-  //
-  // Epilogue.
-  //
-
-  // Special case: last mapping's node contains only the key in explicit notation.
-  if (atExplicitKey) {
-    storeMappingPair(state, _result, overridableKeys, keyTag, keyNode, null, _keyLine, _keyLineStart, _keyPos);
-  }
-
-  // Expose the resulting mapping.
-  if (detected) {
-    state.tag = _tag;
-    state.anchor = _anchor;
-    state.kind = 'mapping';
-    state.result = _result;
-  }
-
-  return detected;
-}
-
-function readTagProperty(state) {
-  var _position,
-      isVerbatim = false,
-      isNamed    = false,
-      tagHandle,
-      tagName,
-      ch;
-
-  ch = state.input.charCodeAt(state.position);
-
-  if (ch !== 0x21/* ! */) return false;
-
-  if (state.tag !== null) {
-    throwError(state, 'duplication of a tag property');
-  }
-
-  ch = state.input.charCodeAt(++state.position);
-
-  if (ch === 0x3C/* < */) {
-    isVerbatim = true;
+  function readTagProperty(state) {
+    let isVerbatim = false;
+    let isNamed = false;
+    let tagHandle;
+    let tagName;
+    let ch = state.input.charCodeAt(state.position);
+    if (ch !== 33) return false;
+    if (state.tag !== null) {
+      throwError(state, "duplication of a tag property");
+    }
     ch = state.input.charCodeAt(++state.position);
-
-  } else if (ch === 0x21/* ! */) {
-    isNamed = true;
-    tagHandle = '!!';
-    ch = state.input.charCodeAt(++state.position);
-
-  } else {
-    tagHandle = '!';
-  }
-
-  _position = state.position;
-
-  if (isVerbatim) {
-    do { ch = state.input.charCodeAt(++state.position); }
-    while (ch !== 0 && ch !== 0x3E/* > */);
-
-    if (state.position < state.length) {
-      tagName = state.input.slice(_position, state.position);
+    if (ch === 60) {
+      isVerbatim = true;
+      ch = state.input.charCodeAt(++state.position);
+    } else if (ch === 33) {
+      isNamed = true;
+      tagHandle = "!!";
       ch = state.input.charCodeAt(++state.position);
     } else {
-      throwError(state, 'unexpected end of the stream within a verbatim tag');
+      tagHandle = "!";
     }
-  } else {
-    while (ch !== 0 && !is_WS_OR_EOL(ch)) {
-
-      if (ch === 0x21/* ! */) {
-        if (!isNamed) {
-          tagHandle = state.input.slice(_position - 1, state.position + 1);
-
-          if (!PATTERN_TAG_HANDLE.test(tagHandle)) {
-            throwError(state, 'named tag handle cannot contain such characters');
-          }
-
-          isNamed = true;
-          _position = state.position + 1;
-        } else {
-          throwError(state, 'tag suffix cannot contain exclamation marks');
-        }
+    let _position = state.position;
+    if (isVerbatim) {
+      do {
+        ch = state.input.charCodeAt(++state.position);
+      } while (ch !== 0 && ch !== 62);
+      if (state.position < state.length) {
+        tagName = state.input.slice(_position, state.position);
+        ch = state.input.charCodeAt(++state.position);
+      } else {
+        throwError(state, "unexpected end of the stream within a verbatim tag");
       }
-
+    } else {
+      while (ch !== 0 && !isWsOrEol(ch)) {
+        if (ch === 33) {
+          if (!isNamed) {
+            tagHandle = state.input.slice(_position - 1, state.position + 1);
+            if (!PATTERN_TAG_HANDLE.test(tagHandle)) {
+              throwError(state, "named tag handle cannot contain such characters");
+            }
+            isNamed = true;
+            _position = state.position + 1;
+          } else {
+            throwError(state, "tag suffix cannot contain exclamation marks");
+          }
+        }
+        ch = state.input.charCodeAt(++state.position);
+      }
+      tagName = state.input.slice(_position, state.position);
+      if (PATTERN_FLOW_INDICATORS.test(tagName)) {
+        throwError(state, "tag suffix cannot contain flow indicator characters");
+      }
+    }
+    if (tagName && !PATTERN_TAG_URI.test(tagName)) {
+      throwError(state, "tag name cannot contain such characters: " + tagName);
+    }
+    try {
+      tagName = decodeURIComponent(tagName);
+    } catch (err) {
+      throwError(state, "tag name is malformed: " + tagName);
+    }
+    if (isVerbatim) {
+      state.tag = tagName;
+    } else if (_hasOwnProperty.call(state.tagMap, tagHandle)) {
+      state.tag = state.tagMap[tagHandle] + tagName;
+    } else if (tagHandle === "!") {
+      state.tag = "!" + tagName;
+    } else if (tagHandle === "!!") {
+      state.tag = "tag:yaml.org,2002:" + tagName;
+    } else {
+      throwError(state, 'undeclared tag handle "' + tagHandle + '"');
+    }
+    return true;
+  }
+  function readAnchorProperty(state) {
+    let ch = state.input.charCodeAt(state.position);
+    if (ch !== 38) return false;
+    if (state.anchor !== null) {
+      throwError(state, "duplication of an anchor property");
+    }
+    ch = state.input.charCodeAt(++state.position);
+    const _position = state.position;
+    while (ch !== 0 && !isWsOrEol(ch) && !isFlowIndicator(ch)) {
       ch = state.input.charCodeAt(++state.position);
     }
-
-    tagName = state.input.slice(_position, state.position);
-
-    if (PATTERN_FLOW_INDICATORS.test(tagName)) {
-      throwError(state, 'tag suffix cannot contain flow indicator characters');
+    if (state.position === _position) {
+      throwError(state, "name of an anchor node must contain at least one character");
     }
+    state.anchor = state.input.slice(_position, state.position);
+    return true;
   }
-
-  if (tagName && !PATTERN_TAG_URI.test(tagName)) {
-    throwError(state, 'tag name cannot contain such characters: ' + tagName);
-  }
-
-  try {
-    tagName = decodeURIComponent(tagName);
-  } catch (err) {
-    throwError(state, 'tag name is malformed: ' + tagName);
-  }
-
-  if (isVerbatim) {
-    state.tag = tagName;
-
-  } else if (_hasOwnProperty$1.call(state.tagMap, tagHandle)) {
-    state.tag = state.tagMap[tagHandle] + tagName;
-
-  } else if (tagHandle === '!') {
-    state.tag = '!' + tagName;
-
-  } else if (tagHandle === '!!') {
-    state.tag = 'tag:yaml.org,2002:' + tagName;
-
-  } else {
-    throwError(state, 'undeclared tag handle "' + tagHandle + '"');
-  }
-
-  return true;
-}
-
-function readAnchorProperty(state) {
-  var _position,
-      ch;
-
-  ch = state.input.charCodeAt(state.position);
-
-  if (ch !== 0x26/* & */) return false;
-
-  if (state.anchor !== null) {
-    throwError(state, 'duplication of an anchor property');
-  }
-
-  ch = state.input.charCodeAt(++state.position);
-  _position = state.position;
-
-  while (ch !== 0 && !is_WS_OR_EOL(ch) && !is_FLOW_INDICATOR(ch)) {
+  function readAlias(state) {
+    let ch = state.input.charCodeAt(state.position);
+    if (ch !== 42) return false;
     ch = state.input.charCodeAt(++state.position);
-  }
-
-  if (state.position === _position) {
-    throwError(state, 'name of an anchor node must contain at least one character');
-  }
-
-  state.anchor = state.input.slice(_position, state.position);
-  return true;
-}
-
-function readAlias(state) {
-  var _position, alias,
-      ch;
-
-  ch = state.input.charCodeAt(state.position);
-
-  if (ch !== 0x2A/* * */) return false;
-
-  ch = state.input.charCodeAt(++state.position);
-  _position = state.position;
-
-  while (ch !== 0 && !is_WS_OR_EOL(ch) && !is_FLOW_INDICATOR(ch)) {
-    ch = state.input.charCodeAt(++state.position);
-  }
-
-  if (state.position === _position) {
-    throwError(state, 'name of an alias node must contain at least one character');
-  }
-
-  alias = state.input.slice(_position, state.position);
-
-  if (!_hasOwnProperty$1.call(state.anchorMap, alias)) {
-    throwError(state, 'unidentified alias "' + alias + '"');
-  }
-
-  state.result = state.anchorMap[alias];
-  skipSeparationSpace(state, true, -1);
-  return true;
-}
-
-function composeNode(state, parentIndent, nodeContext, allowToSeek, allowCompact) {
-  var allowBlockStyles,
-      allowBlockScalars,
-      allowBlockCollections,
-      indentStatus = 1, // 1: this>parent, 0: this=parent, -1: this<parent
-      atNewLine  = false,
-      hasContent = false,
-      typeIndex,
-      typeQuantity,
-      typeList,
-      type,
-      flowIndent,
-      blockIndent;
-
-  if (state.listener !== null) {
-    state.listener('open', state);
-  }
-
-  state.tag    = null;
-  state.anchor = null;
-  state.kind   = null;
-  state.result = null;
-
-  allowBlockStyles = allowBlockScalars = allowBlockCollections =
-    CONTEXT_BLOCK_OUT === nodeContext ||
-    CONTEXT_BLOCK_IN  === nodeContext;
-
-  if (allowToSeek) {
-    if (skipSeparationSpace(state, true, -1)) {
-      atNewLine = true;
-
-      if (state.lineIndent > parentIndent) {
-        indentStatus = 1;
-      } else if (state.lineIndent === parentIndent) {
-        indentStatus = 0;
-      } else if (state.lineIndent < parentIndent) {
-        indentStatus = -1;
-      }
+    const _position = state.position;
+    while (ch !== 0 && !isWsOrEol(ch) && !isFlowIndicator(ch)) {
+      ch = state.input.charCodeAt(++state.position);
     }
+    if (state.position === _position) {
+      throwError(state, "name of an alias node must contain at least one character");
+    }
+    const alias = state.input.slice(_position, state.position);
+    if (!_hasOwnProperty.call(state.anchorMap, alias)) {
+      throwError(state, 'unidentified alias "' + alias + '"');
+    }
+    state.result = state.anchorMap[alias];
+    skipSeparationSpace(state, true, -1);
+    return true;
   }
-
-  if (indentStatus === 1) {
-    while (readTagProperty(state) || readAnchorProperty(state)) {
+  function tryReadBlockMappingFromProperty(state, propertyStart, nodeIndent, flowIndent) {
+    const fallbackState = snapshotState(state);
+    beginAnchorTransaction(state);
+    restoreState(state, propertyStart);
+    state.tag = null;
+    state.anchor = null;
+    state.kind = null;
+    state.result = null;
+    if (readBlockMapping(state, nodeIndent, flowIndent) && state.kind === "mapping") {
+      commitAnchorTransaction(state);
+      return true;
+    }
+    rollbackAnchorTransaction(state);
+    restoreState(state, fallbackState);
+    return false;
+  }
+  function composeNode(state, parentIndent, nodeContext, allowToSeek, allowCompact) {
+    let allowBlockScalars;
+    let allowBlockCollections;
+    let indentStatus = 1;
+    let atNewLine = false;
+    let hasContent = false;
+    let propertyStart = null;
+    let type2;
+    let flowIndent;
+    let blockIndent;
+    if (state.depth >= state.maxDepth) {
+      throwError(state, "nesting exceeded maxDepth (" + state.maxDepth + ")");
+    }
+    state.depth += 1;
+    if (state.listener !== null) {
+      state.listener("open", state);
+    }
+    state.tag = null;
+    state.anchor = null;
+    state.kind = null;
+    state.result = null;
+    const allowBlockStyles = allowBlockScalars = allowBlockCollections = CONTEXT_BLOCK_OUT === nodeContext || CONTEXT_BLOCK_IN === nodeContext;
+    if (allowToSeek) {
       if (skipSeparationSpace(state, true, -1)) {
         atNewLine = true;
-        allowBlockCollections = allowBlockStyles;
-
         if (state.lineIndent > parentIndent) {
           indentStatus = 1;
         } else if (state.lineIndent === parentIndent) {
@@ -43107,299 +45353,970 @@ function composeNode(state, parentIndent, nodeContext, allowToSeek, allowCompact
         } else if (state.lineIndent < parentIndent) {
           indentStatus = -1;
         }
-      } else {
-        allowBlockCollections = false;
       }
     }
-  }
-
-  if (allowBlockCollections) {
-    allowBlockCollections = atNewLine || allowCompact;
-  }
-
-  if (indentStatus === 1 || CONTEXT_BLOCK_OUT === nodeContext) {
-    if (CONTEXT_FLOW_IN === nodeContext || CONTEXT_FLOW_OUT === nodeContext) {
-      flowIndent = parentIndent;
-    } else {
-      flowIndent = parentIndent + 1;
-    }
-
-    blockIndent = state.position - state.lineStart;
-
     if (indentStatus === 1) {
-      if (allowBlockCollections &&
-          (readBlockSequence(state, blockIndent) ||
-           readBlockMapping(state, blockIndent, flowIndent)) ||
-          readFlowCollection(state, flowIndent)) {
-        hasContent = true;
+      while (true) {
+        const ch = state.input.charCodeAt(state.position);
+        const propertyState = snapshotState(state);
+        if (atNewLine && (ch === 33 && state.tag !== null || ch === 38 && state.anchor !== null)) {
+          break;
+        }
+        if (!readTagProperty(state) && !readAnchorProperty(state)) {
+          break;
+        }
+        if (propertyStart === null) {
+          propertyStart = propertyState;
+        }
+        if (skipSeparationSpace(state, true, -1)) {
+          atNewLine = true;
+          allowBlockCollections = allowBlockStyles;
+          if (state.lineIndent > parentIndent) {
+            indentStatus = 1;
+          } else if (state.lineIndent === parentIndent) {
+            indentStatus = 0;
+          } else if (state.lineIndent < parentIndent) {
+            indentStatus = -1;
+          }
+        } else {
+          allowBlockCollections = false;
+        }
+      }
+    }
+    if (allowBlockCollections) {
+      allowBlockCollections = atNewLine || allowCompact;
+    }
+    if (indentStatus === 1 || CONTEXT_BLOCK_OUT === nodeContext) {
+      if (CONTEXT_FLOW_IN === nodeContext || CONTEXT_FLOW_OUT === nodeContext) {
+        flowIndent = parentIndent;
       } else {
-        if ((allowBlockScalars && readBlockScalar(state, flowIndent)) ||
-            readSingleQuotedScalar(state, flowIndent) ||
-            readDoubleQuotedScalar(state, flowIndent)) {
-          hasContent = true;
-
-        } else if (readAlias(state)) {
-          hasContent = true;
-
-          if (state.tag !== null || state.anchor !== null) {
-            throwError(state, 'alias node should not have any properties');
-          }
-
-        } else if (readPlainScalar(state, flowIndent, CONTEXT_FLOW_IN === nodeContext)) {
-          hasContent = true;
-
-          if (state.tag === null) {
-            state.tag = '?';
-          }
-        }
-
-        if (state.anchor !== null) {
-          state.anchorMap[state.anchor] = state.result;
-        }
+        flowIndent = parentIndent + 1;
       }
-    } else if (indentStatus === 0) {
-      // Special case: block sequences are allowed to have same indentation level as the parent.
-      // http://www.yaml.org/spec/1.2/spec.html#id2799784
-      hasContent = allowBlockCollections && readBlockSequence(state, blockIndent);
-    }
-  }
-
-  if (state.tag === null) {
-    if (state.anchor !== null) {
-      state.anchorMap[state.anchor] = state.result;
-    }
-
-  } else if (state.tag === '?') {
-    // Implicit resolving is not allowed for non-scalar types, and '?'
-    // non-specific tag is only automatically assigned to plain scalars.
-    //
-    // We only need to check kind conformity in case user explicitly assigns '?'
-    // tag, for example like this: "!<?> [0]"
-    //
-    if (state.result !== null && state.kind !== 'scalar') {
-      throwError(state, 'unacceptable node kind for !<?> tag; it should be "scalar", not "' + state.kind + '"');
-    }
-
-    for (typeIndex = 0, typeQuantity = state.implicitTypes.length; typeIndex < typeQuantity; typeIndex += 1) {
-      type = state.implicitTypes[typeIndex];
-
-      if (type.resolve(state.result)) { // `state.result` updated in resolver if matched
-        state.result = type.construct(state.result);
-        state.tag = type.tag;
-        if (state.anchor !== null) {
-          state.anchorMap[state.anchor] = state.result;
+      blockIndent = state.position - state.lineStart;
+      if (indentStatus === 1) {
+        if (allowBlockCollections && (readBlockSequence(state, blockIndent) || readBlockMapping(state, blockIndent, flowIndent)) || readFlowCollection(state, flowIndent)) {
+          hasContent = true;
+        } else {
+          const ch = state.input.charCodeAt(state.position);
+          if (propertyStart !== null && allowBlockStyles && !allowBlockCollections && ch !== 124 && ch !== 62 && tryReadBlockMappingFromProperty(
+            state,
+            propertyStart,
+            propertyStart.position - propertyStart.lineStart,
+            flowIndent
+          )) {
+            hasContent = true;
+          } else if (allowBlockScalars && readBlockScalar(state, flowIndent) || readSingleQuotedScalar(state, flowIndent) || readDoubleQuotedScalar(state, flowIndent)) {
+            hasContent = true;
+          } else if (readAlias(state)) {
+            hasContent = true;
+            if (state.tag !== null || state.anchor !== null) {
+              throwError(state, "alias node should not have any properties");
+            }
+          } else if (readPlainScalar(state, flowIndent, CONTEXT_FLOW_IN === nodeContext)) {
+            hasContent = true;
+            if (state.tag === null) {
+              state.tag = "?";
+            }
+          }
+          if (state.anchor !== null) {
+            storeAnchor(state, state.anchor, state.result);
+          }
         }
-        break;
+      } else if (indentStatus === 0) {
+        hasContent = allowBlockCollections && readBlockSequence(state, blockIndent);
       }
     }
-  } else if (state.tag !== '!') {
-    if (_hasOwnProperty$1.call(state.typeMap[state.kind || 'fallback'], state.tag)) {
-      type = state.typeMap[state.kind || 'fallback'][state.tag];
-    } else {
-      // looking for multi type
-      type = null;
-      typeList = state.typeMap.multi[state.kind || 'fallback'];
-
-      for (typeIndex = 0, typeQuantity = typeList.length; typeIndex < typeQuantity; typeIndex += 1) {
-        if (state.tag.slice(0, typeList[typeIndex].tag.length) === typeList[typeIndex].tag) {
-          type = typeList[typeIndex];
+    if (state.tag === null) {
+      if (state.anchor !== null) {
+        storeAnchor(state, state.anchor, state.result);
+      }
+    } else if (state.tag === "?") {
+      if (state.result !== null && state.kind !== "scalar") {
+        throwError(state, 'unacceptable node kind for !<?> tag; it should be "scalar", not "' + state.kind + '"');
+      }
+      for (let typeIndex = 0, typeQuantity = state.implicitTypes.length; typeIndex < typeQuantity; typeIndex += 1) {
+        type2 = state.implicitTypes[typeIndex];
+        if (type2.resolve(state.result)) {
+          state.result = type2.construct(state.result);
+          state.tag = type2.tag;
+          if (state.anchor !== null) {
+            storeAnchor(state, state.anchor, state.result);
+          }
           break;
         }
       }
-    }
-
-    if (!type) {
-      throwError(state, 'unknown tag !<' + state.tag + '>');
-    }
-
-    if (state.result !== null && type.kind !== state.kind) {
-      throwError(state, 'unacceptable node kind for !<' + state.tag + '> tag; it should be "' + type.kind + '", not "' + state.kind + '"');
-    }
-
-    if (!type.resolve(state.result, state.tag)) { // `state.result` updated in resolver if matched
-      throwError(state, 'cannot resolve a node with !<' + state.tag + '> explicit tag');
-    } else {
-      state.result = type.construct(state.result, state.tag);
-      if (state.anchor !== null) {
-        state.anchorMap[state.anchor] = state.result;
+    } else if (state.tag !== "!") {
+      if (_hasOwnProperty.call(state.typeMap[state.kind || "fallback"], state.tag)) {
+        type2 = state.typeMap[state.kind || "fallback"][state.tag];
+      } else {
+        type2 = null;
+        const typeList = state.typeMap.multi[state.kind || "fallback"];
+        for (let typeIndex = 0, typeQuantity = typeList.length; typeIndex < typeQuantity; typeIndex += 1) {
+          if (state.tag.slice(0, typeList[typeIndex].tag.length) === typeList[typeIndex].tag) {
+            type2 = typeList[typeIndex];
+            break;
+          }
+        }
+      }
+      if (!type2) {
+        throwError(state, "unknown tag !<" + state.tag + ">");
+      }
+      if (state.result !== null && type2.kind !== state.kind) {
+        throwError(state, "unacceptable node kind for !<" + state.tag + '> tag; it should be "' + type2.kind + '", not "' + state.kind + '"');
+      }
+      if (!type2.resolve(state.result, state.tag)) {
+        throwError(state, "cannot resolve a node with !<" + state.tag + "> explicit tag");
+      } else {
+        state.result = type2.construct(state.result, state.tag);
+        if (state.anchor !== null) {
+          storeAnchor(state, state.anchor, state.result);
+        }
       }
     }
+    if (state.listener !== null) {
+      state.listener("close", state);
+    }
+    state.depth -= 1;
+    return state.tag !== null || state.anchor !== null || hasContent;
   }
-
-  if (state.listener !== null) {
-    state.listener('close', state);
-  }
-  return state.tag !== null ||  state.anchor !== null || hasContent;
-}
-
-function readDocument(state) {
-  var documentStart = state.position,
-      _position,
-      directiveName,
-      directiveArgs,
-      hasDirectives = false,
-      ch;
-
-  state.version = null;
-  state.checkLineBreaks = state.legacy;
-  state.tagMap = Object.create(null);
-  state.anchorMap = Object.create(null);
-
-  while ((ch = state.input.charCodeAt(state.position)) !== 0) {
-    skipSeparationSpace(state, true, -1);
-
-    ch = state.input.charCodeAt(state.position);
-
-    if (state.lineIndent > 0 || ch !== 0x25/* % */) {
-      break;
-    }
-
-    hasDirectives = true;
-    ch = state.input.charCodeAt(++state.position);
-    _position = state.position;
-
-    while (ch !== 0 && !is_WS_OR_EOL(ch)) {
-      ch = state.input.charCodeAt(++state.position);
-    }
-
-    directiveName = state.input.slice(_position, state.position);
-    directiveArgs = [];
-
-    if (directiveName.length < 1) {
-      throwError(state, 'directive name must not be less than one character in length');
-    }
-
-    while (ch !== 0) {
-      while (is_WHITE_SPACE(ch)) {
-        ch = state.input.charCodeAt(++state.position);
-      }
-
-      if (ch === 0x23/* # */) {
-        do { ch = state.input.charCodeAt(++state.position); }
-        while (ch !== 0 && !is_EOL(ch));
+  function readDocument(state) {
+    const documentStart = state.position;
+    let hasDirectives = false;
+    let ch;
+    state.version = null;
+    state.checkLineBreaks = state.legacy;
+    state.tagMap = /* @__PURE__ */ Object.create(null);
+    state.anchorMap = /* @__PURE__ */ Object.create(null);
+    while ((ch = state.input.charCodeAt(state.position)) !== 0) {
+      skipSeparationSpace(state, true, -1);
+      ch = state.input.charCodeAt(state.position);
+      if (state.lineIndent > 0 || ch !== 37) {
         break;
       }
-
-      if (is_EOL(ch)) break;
-
-      _position = state.position;
-
-      while (ch !== 0 && !is_WS_OR_EOL(ch)) {
+      hasDirectives = true;
+      ch = state.input.charCodeAt(++state.position);
+      let _position = state.position;
+      while (ch !== 0 && !isWsOrEol(ch)) {
         ch = state.input.charCodeAt(++state.position);
       }
-
-      directiveArgs.push(state.input.slice(_position, state.position));
+      const directiveName = state.input.slice(_position, state.position);
+      const directiveArgs = [];
+      if (directiveName.length < 1) {
+        throwError(state, "directive name must not be less than one character in length");
+      }
+      while (ch !== 0) {
+        while (isWhiteSpace(ch)) {
+          ch = state.input.charCodeAt(++state.position);
+        }
+        if (ch === 35) {
+          do {
+            ch = state.input.charCodeAt(++state.position);
+          } while (ch !== 0 && !isEol(ch));
+          break;
+        }
+        if (isEol(ch)) break;
+        _position = state.position;
+        while (ch !== 0 && !isWsOrEol(ch)) {
+          ch = state.input.charCodeAt(++state.position);
+        }
+        directiveArgs.push(state.input.slice(_position, state.position));
+      }
+      if (ch !== 0) readLineBreak(state);
+      if (_hasOwnProperty.call(directiveHandlers, directiveName)) {
+        directiveHandlers[directiveName](state, directiveName, directiveArgs);
+      } else {
+        throwWarning(state, 'unknown document directive "' + directiveName + '"');
+      }
     }
-
-    if (ch !== 0) readLineBreak(state);
-
-    if (_hasOwnProperty$1.call(directiveHandlers, directiveName)) {
-      directiveHandlers[directiveName](state, directiveName, directiveArgs);
-    } else {
-      throwWarning(state, 'unknown document directive "' + directiveName + '"');
-    }
-  }
-
-  skipSeparationSpace(state, true, -1);
-
-  if (state.lineIndent === 0 &&
-      state.input.charCodeAt(state.position)     === 0x2D/* - */ &&
-      state.input.charCodeAt(state.position + 1) === 0x2D/* - */ &&
-      state.input.charCodeAt(state.position + 2) === 0x2D/* - */) {
-    state.position += 3;
     skipSeparationSpace(state, true, -1);
-
-  } else if (hasDirectives) {
-    throwError(state, 'directives end mark is expected');
-  }
-
-  composeNode(state, state.lineIndent - 1, CONTEXT_BLOCK_OUT, false, true);
-  skipSeparationSpace(state, true, -1);
-
-  if (state.checkLineBreaks &&
-      PATTERN_NON_ASCII_LINE_BREAKS.test(state.input.slice(documentStart, state.position))) {
-    throwWarning(state, 'non-ASCII line breaks are interpreted as content');
-  }
-
-  state.documents.push(state.result);
-
-  if (state.position === state.lineStart && testDocumentSeparator(state)) {
-
-    if (state.input.charCodeAt(state.position) === 0x2E/* . */) {
+    if (state.lineIndent === 0 && state.input.charCodeAt(state.position) === 45 && state.input.charCodeAt(state.position + 1) === 45 && state.input.charCodeAt(state.position + 2) === 45) {
       state.position += 3;
       skipSeparationSpace(state, true, -1);
+    } else if (hasDirectives) {
+      throwError(state, "directives end mark is expected");
     }
-    return;
-  }
-
-  if (state.position < (state.length - 1)) {
-    throwError(state, 'end of the stream or a document separator is expected');
-  } else {
-    return;
-  }
-}
-
-
-function loadDocuments(input, options) {
-  input = String(input);
-  options = options || {};
-
-  if (input.length !== 0) {
-
-    // Add tailing `\n` if not exists
-    if (input.charCodeAt(input.length - 1) !== 0x0A/* LF */ &&
-        input.charCodeAt(input.length - 1) !== 0x0D/* CR */) {
-      input += '\n';
+    composeNode(state, state.lineIndent - 1, CONTEXT_BLOCK_OUT, false, true);
+    skipSeparationSpace(state, true, -1);
+    if (state.checkLineBreaks && PATTERN_NON_ASCII_LINE_BREAKS.test(state.input.slice(documentStart, state.position))) {
+      throwWarning(state, "non-ASCII line breaks are interpreted as content");
     }
-
-    // Strip BOM
-    if (input.charCodeAt(0) === 0xFEFF) {
-      input = input.slice(1);
+    state.documents.push(state.result);
+    if (state.position === state.lineStart && testDocumentSeparator(state)) {
+      if (state.input.charCodeAt(state.position) === 46) {
+        state.position += 3;
+        skipSeparationSpace(state, true, -1);
+      }
+      return;
+    }
+    if (state.position < state.length - 1) {
+      throwError(state, "end of the stream or a document separator is expected");
     }
   }
-
-  var state = new State$1(input, options);
-
-  var nullpos = input.indexOf('\0');
-
-  if (nullpos !== -1) {
-    state.position = nullpos;
-    throwError(state, 'null byte is not allowed in input');
+  function loadDocuments(input, options) {
+    input = String(input);
+    options = options || {};
+    if (input.length !== 0) {
+      if (input.charCodeAt(input.length - 1) !== 10 && input.charCodeAt(input.length - 1) !== 13) {
+        input += "\n";
+      }
+      if (input.charCodeAt(0) === 65279) {
+        input = input.slice(1);
+      }
+    }
+    const state = new State(input, options);
+    const nullpos = input.indexOf("\0");
+    if (nullpos !== -1) {
+      state.position = nullpos;
+      throwError(state, "null byte is not allowed in input");
+    }
+    state.input += "\0";
+    while (state.input.charCodeAt(state.position) === 32) {
+      state.lineIndent += 1;
+      state.position += 1;
+    }
+    while (state.position < state.length - 1) {
+      readDocument(state);
+    }
+    return state.documents;
   }
-
-  // Use 0 as string terminator. That significantly simplifies bounds check.
-  state.input += '\0';
-
-  while (state.input.charCodeAt(state.position) === 0x20/* Space */) {
-    state.lineIndent += 1;
-    state.position += 1;
+  function loadAll2(input, iterator, options) {
+    if (iterator !== null && typeof iterator === "object" && typeof options === "undefined") {
+      options = iterator;
+      iterator = null;
+    }
+    const documents = loadDocuments(input, options);
+    if (typeof iterator !== "function") {
+      return documents;
+    }
+    for (let index = 0, length = documents.length; index < length; index += 1) {
+      iterator(documents[index]);
+    }
   }
-
-  while (state.position < (state.length - 1)) {
-    readDocument(state);
+  function load2(input, options) {
+    const documents = loadDocuments(input, options);
+    if (documents.length === 0) {
+      return void 0;
+    } else if (documents.length === 1) {
+      return documents[0];
+    }
+    throw new YAMLException2("expected a single document in the stream, but found more");
   }
-
-  return state.documents;
+  loader.loadAll = loadAll2;
+  loader.load = load2;
+  return loader;
 }
-
-
-function load$1(input, options) {
-  var documents = loadDocuments(input, options);
-
-  if (documents.length === 0) {
-    /*eslint-disable no-undefined*/
-    return undefined;
-  } else if (documents.length === 1) {
-    return documents[0];
+var dumper = {};
+var hasRequiredDumper;
+function requireDumper() {
+  if (hasRequiredDumper) return dumper;
+  hasRequiredDumper = 1;
+  const common2 = requireCommon();
+  const YAMLException2 = requireException();
+  const DEFAULT_SCHEMA2 = require_default();
+  const _toString = Object.prototype.toString;
+  const _hasOwnProperty = Object.prototype.hasOwnProperty;
+  const CHAR_BOM = 65279;
+  const CHAR_TAB = 9;
+  const CHAR_LINE_FEED = 10;
+  const CHAR_CARRIAGE_RETURN = 13;
+  const CHAR_SPACE = 32;
+  const CHAR_EXCLAMATION = 33;
+  const CHAR_DOUBLE_QUOTE = 34;
+  const CHAR_SHARP = 35;
+  const CHAR_PERCENT = 37;
+  const CHAR_AMPERSAND = 38;
+  const CHAR_SINGLE_QUOTE = 39;
+  const CHAR_ASTERISK = 42;
+  const CHAR_COMMA = 44;
+  const CHAR_MINUS = 45;
+  const CHAR_COLON = 58;
+  const CHAR_EQUALS = 61;
+  const CHAR_GREATER_THAN = 62;
+  const CHAR_QUESTION = 63;
+  const CHAR_COMMERCIAL_AT = 64;
+  const CHAR_LEFT_SQUARE_BRACKET = 91;
+  const CHAR_RIGHT_SQUARE_BRACKET = 93;
+  const CHAR_GRAVE_ACCENT = 96;
+  const CHAR_LEFT_CURLY_BRACKET = 123;
+  const CHAR_VERTICAL_LINE = 124;
+  const CHAR_RIGHT_CURLY_BRACKET = 125;
+  const ESCAPE_SEQUENCES = {};
+  ESCAPE_SEQUENCES[0] = "\\0";
+  ESCAPE_SEQUENCES[7] = "\\a";
+  ESCAPE_SEQUENCES[8] = "\\b";
+  ESCAPE_SEQUENCES[9] = "\\t";
+  ESCAPE_SEQUENCES[10] = "\\n";
+  ESCAPE_SEQUENCES[11] = "\\v";
+  ESCAPE_SEQUENCES[12] = "\\f";
+  ESCAPE_SEQUENCES[13] = "\\r";
+  ESCAPE_SEQUENCES[27] = "\\e";
+  ESCAPE_SEQUENCES[34] = '\\"';
+  ESCAPE_SEQUENCES[92] = "\\\\";
+  ESCAPE_SEQUENCES[133] = "\\N";
+  ESCAPE_SEQUENCES[160] = "\\_";
+  ESCAPE_SEQUENCES[8232] = "\\L";
+  ESCAPE_SEQUENCES[8233] = "\\P";
+  const DEPRECATED_BOOLEANS_SYNTAX = [
+    "y",
+    "Y",
+    "yes",
+    "Yes",
+    "YES",
+    "on",
+    "On",
+    "ON",
+    "n",
+    "N",
+    "no",
+    "No",
+    "NO",
+    "off",
+    "Off",
+    "OFF"
+  ];
+  const DEPRECATED_BASE60_SYNTAX = /^[-+]?[0-9_]+(?::[0-9_]+)+(?:\.[0-9_]*)?$/;
+  function compileStyleMap(schema2, map2) {
+    if (map2 === null) return {};
+    const result = {};
+    const keys = Object.keys(map2);
+    for (let index = 0, length = keys.length; index < length; index += 1) {
+      let tag = keys[index];
+      let style = String(map2[tag]);
+      if (tag.slice(0, 2) === "!!") {
+        tag = "tag:yaml.org,2002:" + tag.slice(2);
+      }
+      const type2 = schema2.compiledTypeMap["fallback"][tag];
+      if (type2 && _hasOwnProperty.call(type2.styleAliases, style)) {
+        style = type2.styleAliases[style];
+      }
+      result[tag] = style;
+    }
+    return result;
   }
-  throw new exception('expected a single document in the stream, but found more');
+  function encodeHex(character) {
+    let handle;
+    let length;
+    const string = character.toString(16).toUpperCase();
+    if (character <= 255) {
+      handle = "x";
+      length = 2;
+    } else if (character <= 65535) {
+      handle = "u";
+      length = 4;
+    } else if (character <= 4294967295) {
+      handle = "U";
+      length = 8;
+    } else {
+      throw new YAMLException2("code point within a string may not be greater than 0xFFFFFFFF");
+    }
+    return "\\" + handle + common2.repeat("0", length - string.length) + string;
+  }
+  const QUOTING_TYPE_SINGLE = 1;
+  const QUOTING_TYPE_DOUBLE = 2;
+  function State(options) {
+    this.schema = options["schema"] || DEFAULT_SCHEMA2;
+    this.indent = Math.max(1, options["indent"] || 2);
+    this.noArrayIndent = options["noArrayIndent"] || false;
+    this.skipInvalid = options["skipInvalid"] || false;
+    this.flowLevel = common2.isNothing(options["flowLevel"]) ? -1 : options["flowLevel"];
+    this.styleMap = compileStyleMap(this.schema, options["styles"] || null);
+    this.sortKeys = options["sortKeys"] || false;
+    this.lineWidth = options["lineWidth"] || 80;
+    this.noRefs = options["noRefs"] || false;
+    this.noCompatMode = options["noCompatMode"] || false;
+    this.condenseFlow = options["condenseFlow"] || false;
+    this.quotingType = options["quotingType"] === '"' ? QUOTING_TYPE_DOUBLE : QUOTING_TYPE_SINGLE;
+    this.forceQuotes = options["forceQuotes"] || false;
+    this.replacer = typeof options["replacer"] === "function" ? options["replacer"] : null;
+    this.implicitTypes = this.schema.compiledImplicit;
+    this.explicitTypes = this.schema.compiledExplicit;
+    this.tag = null;
+    this.result = "";
+    this.duplicates = [];
+    this.usedDuplicates = null;
+  }
+  function indentString(string, spaces) {
+    const ind = common2.repeat(" ", spaces);
+    let position = 0;
+    let result = "";
+    const length = string.length;
+    while (position < length) {
+      let line;
+      const next = string.indexOf("\n", position);
+      if (next === -1) {
+        line = string.slice(position);
+        position = length;
+      } else {
+        line = string.slice(position, next + 1);
+        position = next + 1;
+      }
+      if (line.length && line !== "\n") result += ind;
+      result += line;
+    }
+    return result;
+  }
+  function generateNextLine(state, level) {
+    return "\n" + common2.repeat(" ", state.indent * level);
+  }
+  function testImplicitResolving(state, str2) {
+    for (let index = 0, length = state.implicitTypes.length; index < length; index += 1) {
+      const type2 = state.implicitTypes[index];
+      if (type2.resolve(str2)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  function isWhitespace(c) {
+    return c === CHAR_SPACE || c === CHAR_TAB;
+  }
+  function isPrintable(c) {
+    return c >= 32 && c <= 126 || c >= 161 && c <= 55295 && c !== 8232 && c !== 8233 || c >= 57344 && c <= 65533 && c !== CHAR_BOM || c >= 65536 && c <= 1114111;
+  }
+  function isNsCharOrWhitespace(c) {
+    return isPrintable(c) && c !== CHAR_BOM && // - b-char
+    c !== CHAR_CARRIAGE_RETURN && c !== CHAR_LINE_FEED;
+  }
+  function isPlainSafe(c, prev, inblock) {
+    const cIsNsCharOrWhitespace = isNsCharOrWhitespace(c);
+    const cIsNsChar = cIsNsCharOrWhitespace && !isWhitespace(c);
+    return (
+      // ns-plain-safe
+      (inblock ? cIsNsCharOrWhitespace : cIsNsCharOrWhitespace && // - c-flow-indicator
+      c !== CHAR_COMMA && c !== CHAR_LEFT_SQUARE_BRACKET && c !== CHAR_RIGHT_SQUARE_BRACKET && c !== CHAR_LEFT_CURLY_BRACKET && c !== CHAR_RIGHT_CURLY_BRACKET) && // ns-plain-char
+      c !== CHAR_SHARP && // false on '#'
+      !(prev === CHAR_COLON && !cIsNsChar) || // false on ': '
+      isNsCharOrWhitespace(prev) && !isWhitespace(prev) && c === CHAR_SHARP || // change to true on '[^ ]#'
+      prev === CHAR_COLON && cIsNsChar
+    );
+  }
+  function isPlainSafeFirst(c) {
+    return isPrintable(c) && c !== CHAR_BOM && !isWhitespace(c) && // - s-white
+    // - (c-indicator ::=
+    // “-” | “?” | “:” | “,” | “[” | “]” | “{” | “}”
+    c !== CHAR_MINUS && c !== CHAR_QUESTION && c !== CHAR_COLON && c !== CHAR_COMMA && c !== CHAR_LEFT_SQUARE_BRACKET && c !== CHAR_RIGHT_SQUARE_BRACKET && c !== CHAR_LEFT_CURLY_BRACKET && c !== CHAR_RIGHT_CURLY_BRACKET && // | “#” | “&” | “*” | “!” | “|” | “=” | “>” | “'” | “"”
+    c !== CHAR_SHARP && c !== CHAR_AMPERSAND && c !== CHAR_ASTERISK && c !== CHAR_EXCLAMATION && c !== CHAR_VERTICAL_LINE && c !== CHAR_EQUALS && c !== CHAR_GREATER_THAN && c !== CHAR_SINGLE_QUOTE && c !== CHAR_DOUBLE_QUOTE && // | “%” | “@” | “`”)
+    c !== CHAR_PERCENT && c !== CHAR_COMMERCIAL_AT && c !== CHAR_GRAVE_ACCENT;
+  }
+  function isPlainSafeLast(c) {
+    return !isWhitespace(c) && c !== CHAR_COLON;
+  }
+  function codePointAt(string, pos) {
+    const first = string.charCodeAt(pos);
+    let second;
+    if (first >= 55296 && first <= 56319 && pos + 1 < string.length) {
+      second = string.charCodeAt(pos + 1);
+      if (second >= 56320 && second <= 57343) {
+        return (first - 55296) * 1024 + second - 56320 + 65536;
+      }
+    }
+    return first;
+  }
+  function needIndentIndicator(string) {
+    const leadingSpaceRe = /^\n* /;
+    return leadingSpaceRe.test(string);
+  }
+  const STYLE_PLAIN = 1;
+  const STYLE_SINGLE = 2;
+  const STYLE_LITERAL = 3;
+  const STYLE_FOLDED = 4;
+  const STYLE_DOUBLE = 5;
+  function chooseScalarStyle(string, singleLineOnly, indentPerLevel, lineWidth, testAmbiguousType, quotingType, forceQuotes, inblock) {
+    let i;
+    let char = 0;
+    let prevChar = null;
+    let hasLineBreak = false;
+    let hasFoldableLine = false;
+    const shouldTrackWidth = lineWidth !== -1;
+    let previousLineBreak = -1;
+    let plain = isPlainSafeFirst(codePointAt(string, 0)) && isPlainSafeLast(codePointAt(string, string.length - 1));
+    if (singleLineOnly || forceQuotes) {
+      for (i = 0; i < string.length; char >= 65536 ? i += 2 : i++) {
+        char = codePointAt(string, i);
+        if (!isPrintable(char)) {
+          return STYLE_DOUBLE;
+        }
+        plain = plain && isPlainSafe(char, prevChar, inblock);
+        prevChar = char;
+      }
+    } else {
+      for (i = 0; i < string.length; char >= 65536 ? i += 2 : i++) {
+        char = codePointAt(string, i);
+        if (char === CHAR_LINE_FEED) {
+          hasLineBreak = true;
+          if (shouldTrackWidth) {
+            hasFoldableLine = hasFoldableLine || // Foldable line = too long, and not more-indented.
+            i - previousLineBreak - 1 > lineWidth && string[previousLineBreak + 1] !== " ";
+            previousLineBreak = i;
+          }
+        } else if (!isPrintable(char)) {
+          return STYLE_DOUBLE;
+        }
+        plain = plain && isPlainSafe(char, prevChar, inblock);
+        prevChar = char;
+      }
+      hasFoldableLine = hasFoldableLine || shouldTrackWidth && (i - previousLineBreak - 1 > lineWidth && string[previousLineBreak + 1] !== " ");
+    }
+    if (!hasLineBreak && !hasFoldableLine) {
+      if (plain && !forceQuotes && !testAmbiguousType(string)) {
+        return STYLE_PLAIN;
+      }
+      return quotingType === QUOTING_TYPE_DOUBLE ? STYLE_DOUBLE : STYLE_SINGLE;
+    }
+    if (indentPerLevel > 9 && needIndentIndicator(string)) {
+      return STYLE_DOUBLE;
+    }
+    if (!forceQuotes) {
+      return hasFoldableLine ? STYLE_FOLDED : STYLE_LITERAL;
+    }
+    return quotingType === QUOTING_TYPE_DOUBLE ? STYLE_DOUBLE : STYLE_SINGLE;
+  }
+  function writeScalar(state, string, level, iskey, inblock) {
+    state.dump = (function() {
+      if (string.length === 0) {
+        return state.quotingType === QUOTING_TYPE_DOUBLE ? '""' : "''";
+      }
+      if (!state.noCompatMode) {
+        if (DEPRECATED_BOOLEANS_SYNTAX.indexOf(string) !== -1 || DEPRECATED_BASE60_SYNTAX.test(string)) {
+          return state.quotingType === QUOTING_TYPE_DOUBLE ? '"' + string + '"' : "'" + string + "'";
+        }
+      }
+      const indent = state.indent * Math.max(1, level);
+      const lineWidth = state.lineWidth === -1 ? -1 : Math.max(Math.min(state.lineWidth, 40), state.lineWidth - indent);
+      const singleLineOnly = iskey || // No block styles in flow mode.
+      state.flowLevel > -1 && level >= state.flowLevel;
+      function testAmbiguity(string2) {
+        return testImplicitResolving(state, string2);
+      }
+      switch (chooseScalarStyle(
+        string,
+        singleLineOnly,
+        state.indent,
+        lineWidth,
+        testAmbiguity,
+        state.quotingType,
+        state.forceQuotes && !iskey,
+        inblock
+      )) {
+        case STYLE_PLAIN:
+          return string;
+        case STYLE_SINGLE:
+          return "'" + string.replace(/'/g, "''") + "'";
+        case STYLE_LITERAL:
+          return "|" + blockHeader(string, state.indent) + dropEndingNewline(indentString(string, indent));
+        case STYLE_FOLDED:
+          return ">" + blockHeader(string, state.indent) + dropEndingNewline(indentString(foldString(string, lineWidth), indent));
+        case STYLE_DOUBLE:
+          return '"' + escapeString(string) + '"';
+        default:
+          throw new YAMLException2("impossible error: invalid scalar style");
+      }
+    })();
+  }
+  function blockHeader(string, indentPerLevel) {
+    const indentIndicator = needIndentIndicator(string) ? String(indentPerLevel) : "";
+    const clip = string[string.length - 1] === "\n";
+    const keep = clip && (string[string.length - 2] === "\n" || string === "\n");
+    const chomp = keep ? "+" : clip ? "" : "-";
+    return indentIndicator + chomp + "\n";
+  }
+  function dropEndingNewline(string) {
+    return string[string.length - 1] === "\n" ? string.slice(0, -1) : string;
+  }
+  function foldString(string, width) {
+    const lineRe = /(\n+)([^\n]*)/g;
+    let result = (function() {
+      let nextLF = string.indexOf("\n");
+      nextLF = nextLF !== -1 ? nextLF : string.length;
+      lineRe.lastIndex = nextLF;
+      return foldLine(string.slice(0, nextLF), width);
+    })();
+    let prevMoreIndented = string[0] === "\n" || string[0] === " ";
+    let moreIndented;
+    let match;
+    while (match = lineRe.exec(string)) {
+      const prefix = match[1];
+      const line = match[2];
+      moreIndented = line[0] === " ";
+      result += prefix + (!prevMoreIndented && !moreIndented && line !== "" ? "\n" : "") + foldLine(line, width);
+      prevMoreIndented = moreIndented;
+    }
+    return result;
+  }
+  function foldLine(line, width) {
+    if (line === "" || line[0] === " ") return line;
+    const breakRe = / [^ ]/g;
+    let match;
+    let start = 0;
+    let end;
+    let curr = 0;
+    let next = 0;
+    let result = "";
+    while (match = breakRe.exec(line)) {
+      next = match.index;
+      if (next - start > width) {
+        end = curr > start ? curr : next;
+        result += "\n" + line.slice(start, end);
+        start = end + 1;
+      }
+      curr = next;
+    }
+    result += "\n";
+    if (line.length - start > width && curr > start) {
+      result += line.slice(start, curr) + "\n" + line.slice(curr + 1);
+    } else {
+      result += line.slice(start);
+    }
+    return result.slice(1);
+  }
+  function escapeString(string) {
+    let result = "";
+    let char = 0;
+    for (let i = 0; i < string.length; char >= 65536 ? i += 2 : i++) {
+      char = codePointAt(string, i);
+      const escapeSeq = ESCAPE_SEQUENCES[char];
+      if (!escapeSeq && isPrintable(char)) {
+        result += string[i];
+        if (char >= 65536) result += string[i + 1];
+      } else {
+        result += escapeSeq || encodeHex(char);
+      }
+    }
+    return result;
+  }
+  function writeFlowSequence(state, level, object) {
+    let _result = "";
+    const _tag = state.tag;
+    for (let index = 0, length = object.length; index < length; index += 1) {
+      let value = object[index];
+      if (state.replacer) {
+        value = state.replacer.call(object, String(index), value);
+      }
+      if (writeNode(state, level, value, false, false) || typeof value === "undefined" && writeNode(state, level, null, false, false)) {
+        if (_result !== "") _result += "," + (!state.condenseFlow ? " " : "");
+        _result += state.dump;
+      }
+    }
+    state.tag = _tag;
+    state.dump = "[" + _result + "]";
+  }
+  function writeBlockSequence(state, level, object, compact) {
+    let _result = "";
+    const _tag = state.tag;
+    for (let index = 0, length = object.length; index < length; index += 1) {
+      let value = object[index];
+      if (state.replacer) {
+        value = state.replacer.call(object, String(index), value);
+      }
+      if (writeNode(state, level + 1, value, true, true, false, true) || typeof value === "undefined" && writeNode(state, level + 1, null, true, true, false, true)) {
+        if (!compact || _result !== "") {
+          _result += generateNextLine(state, level);
+        }
+        if (state.dump && CHAR_LINE_FEED === state.dump.charCodeAt(0)) {
+          _result += "-";
+        } else {
+          _result += "- ";
+        }
+        _result += state.dump;
+      }
+    }
+    state.tag = _tag;
+    state.dump = _result || "[]";
+  }
+  function writeFlowMapping(state, level, object) {
+    let _result = "";
+    const _tag = state.tag;
+    const objectKeyList = Object.keys(object);
+    for (let index = 0, length = objectKeyList.length; index < length; index += 1) {
+      let pairBuffer = "";
+      if (_result !== "") pairBuffer += ", ";
+      if (state.condenseFlow) pairBuffer += '"';
+      const objectKey = objectKeyList[index];
+      let objectValue = object[objectKey];
+      if (state.replacer) {
+        objectValue = state.replacer.call(object, objectKey, objectValue);
+      }
+      if (!writeNode(state, level, objectKey, false, false)) {
+        continue;
+      }
+      if (state.dump.length > 1024) pairBuffer += "? ";
+      pairBuffer += state.dump + (state.condenseFlow ? '"' : "") + ":" + (state.condenseFlow ? "" : " ");
+      if (!writeNode(state, level, objectValue, false, false)) {
+        continue;
+      }
+      pairBuffer += state.dump;
+      _result += pairBuffer;
+    }
+    state.tag = _tag;
+    state.dump = "{" + _result + "}";
+  }
+  function writeBlockMapping(state, level, object, compact) {
+    let _result = "";
+    const _tag = state.tag;
+    const objectKeyList = Object.keys(object);
+    if (state.sortKeys === true) {
+      objectKeyList.sort();
+    } else if (typeof state.sortKeys === "function") {
+      objectKeyList.sort(state.sortKeys);
+    } else if (state.sortKeys) {
+      throw new YAMLException2("sortKeys must be a boolean or a function");
+    }
+    for (let index = 0, length = objectKeyList.length; index < length; index += 1) {
+      let pairBuffer = "";
+      if (!compact || _result !== "") {
+        pairBuffer += generateNextLine(state, level);
+      }
+      const objectKey = objectKeyList[index];
+      let objectValue = object[objectKey];
+      if (state.replacer) {
+        objectValue = state.replacer.call(object, objectKey, objectValue);
+      }
+      if (!writeNode(state, level + 1, objectKey, true, true, true)) {
+        continue;
+      }
+      const explicitPair = state.tag !== null && state.tag !== "?" || state.dump && state.dump.length > 1024;
+      if (explicitPair) {
+        if (state.dump && CHAR_LINE_FEED === state.dump.charCodeAt(0)) {
+          pairBuffer += "?";
+        } else {
+          pairBuffer += "? ";
+        }
+      }
+      pairBuffer += state.dump;
+      if (explicitPair) {
+        pairBuffer += generateNextLine(state, level);
+      }
+      if (!writeNode(state, level + 1, objectValue, true, explicitPair)) {
+        continue;
+      }
+      if (state.dump && CHAR_LINE_FEED === state.dump.charCodeAt(0)) {
+        pairBuffer += ":";
+      } else {
+        pairBuffer += ": ";
+      }
+      pairBuffer += state.dump;
+      _result += pairBuffer;
+    }
+    state.tag = _tag;
+    state.dump = _result || "{}";
+  }
+  function detectType(state, object, explicit) {
+    const typeList = explicit ? state.explicitTypes : state.implicitTypes;
+    for (let index = 0, length = typeList.length; index < length; index += 1) {
+      const type2 = typeList[index];
+      if ((type2.instanceOf || type2.predicate) && (!type2.instanceOf || typeof object === "object" && object instanceof type2.instanceOf) && (!type2.predicate || type2.predicate(object))) {
+        if (explicit) {
+          if (type2.multi && type2.representName) {
+            state.tag = type2.representName(object);
+          } else {
+            state.tag = type2.tag;
+          }
+        } else {
+          state.tag = "?";
+        }
+        if (type2.represent) {
+          const style = state.styleMap[type2.tag] || type2.defaultStyle;
+          let _result;
+          if (_toString.call(type2.represent) === "[object Function]") {
+            _result = type2.represent(object, style);
+          } else if (_hasOwnProperty.call(type2.represent, style)) {
+            _result = type2.represent[style](object, style);
+          } else {
+            throw new YAMLException2("!<" + type2.tag + '> tag resolver accepts not "' + style + '" style');
+          }
+          state.dump = _result;
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+  function writeNode(state, level, object, block, compact, iskey, isblockseq) {
+    state.tag = null;
+    state.dump = object;
+    if (!detectType(state, object, false)) {
+      detectType(state, object, true);
+    }
+    const type2 = _toString.call(state.dump);
+    const inblock = block;
+    if (block) {
+      block = state.flowLevel < 0 || state.flowLevel > level;
+    }
+    const objectOrArray = type2 === "[object Object]" || type2 === "[object Array]";
+    let duplicateIndex;
+    let duplicate;
+    if (objectOrArray) {
+      duplicateIndex = state.duplicates.indexOf(object);
+      duplicate = duplicateIndex !== -1;
+    }
+    if (state.tag !== null && state.tag !== "?" || duplicate || state.indent !== 2 && level > 0) {
+      compact = false;
+    }
+    if (duplicate && state.usedDuplicates[duplicateIndex]) {
+      state.dump = "*ref_" + duplicateIndex;
+    } else {
+      if (objectOrArray && duplicate && !state.usedDuplicates[duplicateIndex]) {
+        state.usedDuplicates[duplicateIndex] = true;
+      }
+      if (type2 === "[object Object]") {
+        if (block && Object.keys(state.dump).length !== 0) {
+          writeBlockMapping(state, level, state.dump, compact);
+          if (duplicate) {
+            state.dump = "&ref_" + duplicateIndex + state.dump;
+          }
+        } else {
+          writeFlowMapping(state, level, state.dump);
+          if (duplicate) {
+            state.dump = "&ref_" + duplicateIndex + " " + state.dump;
+          }
+        }
+      } else if (type2 === "[object Array]") {
+        if (block && state.dump.length !== 0) {
+          if (state.noArrayIndent && !isblockseq && level > 0) {
+            writeBlockSequence(state, level - 1, state.dump, compact);
+          } else {
+            writeBlockSequence(state, level, state.dump, compact);
+          }
+          if (duplicate) {
+            state.dump = "&ref_" + duplicateIndex + state.dump;
+          }
+        } else {
+          writeFlowSequence(state, level, state.dump);
+          if (duplicate) {
+            state.dump = "&ref_" + duplicateIndex + " " + state.dump;
+          }
+        }
+      } else if (type2 === "[object String]") {
+        if (state.tag !== "?") {
+          writeScalar(state, state.dump, level, iskey, inblock);
+        }
+      } else if (type2 === "[object Undefined]") {
+        return false;
+      } else {
+        if (state.skipInvalid) return false;
+        throw new YAMLException2("unacceptable kind of an object to dump " + type2);
+      }
+      if (state.tag !== null && state.tag !== "?") {
+        let tagStr = encodeURI(
+          state.tag[0] === "!" ? state.tag.slice(1) : state.tag
+        ).replace(/!/g, "%21");
+        if (state.tag[0] === "!") {
+          tagStr = "!" + tagStr;
+        } else if (tagStr.slice(0, 18) === "tag:yaml.org,2002:") {
+          tagStr = "!!" + tagStr.slice(18);
+        } else {
+          tagStr = "!<" + tagStr + ">";
+        }
+        state.dump = tagStr + " " + state.dump;
+      }
+    }
+    return true;
+  }
+  function getDuplicateReferences(object, state) {
+    const objects = [];
+    const duplicatesIndexes = [];
+    inspectNode(object, objects, duplicatesIndexes);
+    const length = duplicatesIndexes.length;
+    for (let index = 0; index < length; index += 1) {
+      state.duplicates.push(objects[duplicatesIndexes[index]]);
+    }
+    state.usedDuplicates = new Array(length);
+  }
+  function inspectNode(object, objects, duplicatesIndexes) {
+    if (object !== null && typeof object === "object") {
+      const index = objects.indexOf(object);
+      if (index !== -1) {
+        if (duplicatesIndexes.indexOf(index) === -1) {
+          duplicatesIndexes.push(index);
+        }
+      } else {
+        objects.push(object);
+        if (Array.isArray(object)) {
+          for (let i = 0, length = object.length; i < length; i += 1) {
+            inspectNode(object[i], objects, duplicatesIndexes);
+          }
+        } else {
+          const objectKeyList = Object.keys(object);
+          for (let i = 0, length = objectKeyList.length; i < length; i += 1) {
+            inspectNode(object[objectKeyList[i]], objects, duplicatesIndexes);
+          }
+        }
+      }
+    }
+  }
+  function dump2(input, options) {
+    options = options || {};
+    const state = new State(options);
+    if (!state.noRefs) getDuplicateReferences(input, state);
+    let value = input;
+    if (state.replacer) {
+      value = state.replacer.call({ "": value }, "", value);
+    }
+    if (writeNode(state, 0, value, true, true)) return state.dump + "\n";
+    return "";
+  }
+  dumper.dump = dump2;
+  return dumper;
 }
-var load_1    = load$1;
-
-var loader = {
-	load: load_1
-};
-var load                = loader.load;
+var hasRequiredJsYaml;
+function requireJsYaml() {
+  if (hasRequiredJsYaml) return jsYaml;
+  hasRequiredJsYaml = 1;
+  const loader2 = requireLoader();
+  const dumper2 = requireDumper();
+  function renamed(from, to) {
+    return function() {
+      throw new Error("Function yaml." + from + " is removed in js-yaml 4. Use yaml." + to + " instead, which is now safe by default.");
+    };
+  }
+  jsYaml.Type = requireType();
+  jsYaml.Schema = requireSchema();
+  jsYaml.FAILSAFE_SCHEMA = requireFailsafe();
+  jsYaml.JSON_SCHEMA = requireJson();
+  jsYaml.CORE_SCHEMA = requireCore();
+  jsYaml.DEFAULT_SCHEMA = require_default();
+  jsYaml.load = loader2.load;
+  jsYaml.loadAll = loader2.loadAll;
+  jsYaml.dump = dumper2.dump;
+  jsYaml.YAMLException = requireException();
+  jsYaml.types = {
+    binary: requireBinary(),
+    float: requireFloat(),
+    map: requireMap(),
+    null: require_null(),
+    pairs: requirePairs(),
+    set: requireSet(),
+    timestamp: requireTimestamp(),
+    bool: requireBool(),
+    int: requireInt(),
+    merge: requireMerge(),
+    omap: requireOmap(),
+    seq: requireSeq(),
+    str: requireStr()
+  };
+  jsYaml.safeLoad = renamed("safeLoad", "load");
+  jsYaml.safeLoadAll = renamed("safeLoadAll", "loadAll");
+  jsYaml.safeDump = renamed("safeDump", "dump");
+  return jsYaml;
+}
+var jsYamlExports = requireJsYaml();
+const yaml = /* @__PURE__ */ getDefaultExportFromCjs(jsYamlExports);
+const {
+  Type,
+  Schema,
+  FAILSAFE_SCHEMA,
+  JSON_SCHEMA,
+  CORE_SCHEMA,
+  DEFAULT_SCHEMA,
+  load,
+  loadAll,
+  dump,
+  YAMLException,
+  types,
+  safeLoad,
+  safeLoadAll,
+  safeDump
+} = yaml;
 
 /**
  * Validates Dependabot configuration against repository's detected ecosystems
@@ -43414,18 +46331,27 @@ class DependabotValidator {
         this.octokit = octokit;
     }
     /**
-     * Validates that all supported ecosystems are configured in dependabot.yml
+     * Validates that all supported ecosystems are configured in dependabot.yml,
+     * and optionally enforces cooldown and groups policies across all update entries.
      * @param owner - Repository owner
      * @param repo - Repository name
      * @param ref - Git reference (branch/tag/commit)
      * @param supportedEcosystems - Set of package ecosystems that should be configured
+     * @param options - Optional policy flags (requireCooldown, requireGroups)
      * @throws {Error} When dependabot.yml is missing or invalid
      */
-    async validateConfiguration(owner, repo, ref, supportedEcosystems) {
+    async validateConfiguration(owner, repo, ref, supportedEcosystems, options = {}) {
         try {
             const dependabotConfig = await this.getDependabotConfig(owner, repo, ref);
             const configuredEcosystems = this.getConfiguredEcosystems(dependabotConfig);
             this.validateEcosystems(supportedEcosystems, configuredEcosystems);
+            const updates = dependabotConfig.updates ?? [];
+            if (options.requireCooldown) {
+                this.validateCooldown(updates);
+            }
+            if (options.requireGroups) {
+                this.validateGroups(updates);
+            }
         }
         catch (error) {
             if (error instanceof Error) {
@@ -43482,6 +46408,56 @@ class DependabotValidator {
             info('All supported ecosystems are configured in dependabot.yml');
         }
     }
+    /**
+     * Validates that every update entry has at least one cooldown day configured.
+     * Iterates all entries (not just detected-language ecosystems) so that
+     * entries like github-actions are also checked.
+     * @param updates - All update entries from dependabot.yml
+     */
+    validateCooldown(updates) {
+        const cooldownKeys = [
+            'default-days',
+            'semver-major-days',
+            'semver-minor-days',
+            'semver-patch-days'
+        ];
+        const missing = updates
+            .filter(update => {
+            const cooldown = update.cooldown;
+            if (!cooldown || typeof cooldown !== 'object')
+                return true;
+            return !cooldownKeys.some(key => cooldown[key] !== undefined && cooldown[key] !== null);
+        })
+            .map(update => update['package-ecosystem']);
+        if (missing.length > 0) {
+            setFailed(`Missing cooldown configuration for ecosystems: ${missing.join(', ')}`);
+        }
+        else {
+            info('All ecosystems have cooldown configured in dependabot.yml');
+        }
+    }
+    /**
+     * Validates that every update entry has at least one group defined.
+     * Iterates all entries (not just detected-language ecosystems) so that
+     * entries like github-actions are also checked.
+     * @param updates - All update entries from dependabot.yml
+     */
+    validateGroups(updates) {
+        const missing = updates
+            .filter(update => {
+            const groups = update.groups;
+            if (!groups || typeof groups !== 'object')
+                return true;
+            return Object.keys(groups).length === 0;
+        })
+            .map(update => update['package-ecosystem']);
+        if (missing.length > 0) {
+            setFailed(`Missing groups configuration for ecosystems: ${missing.join(', ')}`);
+        }
+        else {
+            info('All ecosystems have groups configured in dependabot.yml');
+        }
+    }
 }
 
 /**
@@ -43513,7 +46489,10 @@ async function run() {
         }
         info('');
         const validator = new DependabotValidator(octokit);
-        await validator.validateConfiguration(context$1.repo.owner, context$1.repo.repo, context$1.ref, supportedEcosystems);
+        await validator.validateConfiguration(context$1.repo.owner, context$1.repo.repo, context$1.ref, supportedEcosystems, {
+            requireCooldown: getBooleanInput('require-cooldown'),
+            requireGroups: getBooleanInput('require-groups')
+        });
     }
     catch (error) {
         if (error instanceof Error)
